@@ -26,6 +26,42 @@ COOKIE = 'fixture_session'
 STATE = 'fixture_gateway'
 
 
+class PrefixedReader:
+    """Forward the validated RFB banner once, then the remaining TCP stream."""
+    def __init__(self, reader, prefix):
+        self.reader, self.prefix = reader, prefix
+
+    async def read(self, count):
+        if self.prefix:
+            data, self.prefix = self.prefix[:count], self.prefix[count:]
+            return data
+        return await self.reader.read(count)
+
+
+async def rfb_ready(reader, writer):
+    """Complete a shared, no-auth loopback handshake; no input or framebuffer."""
+    banner = await reader.readexactly(12)
+    if banner != b'RFB 003.008\n':
+        raise ValueError('VNC_PROTOCOL_REFUSED')
+    writer.write(banner)
+    await writer.drain()
+    count = (await reader.readexactly(1))[0]
+    if not 1 <= count <= 16 or 1 not in await reader.readexactly(count):
+        raise ValueError('VNC_SECURITY_REFUSED')
+    writer.write(b'\x01')
+    await writer.drain()
+    if await reader.readexactly(4) != b'\0\0\0\0':
+        raise ValueError('VNC_SECURITY_REFUSED')
+    writer.write(b'\x01')  # Shared client; never evicts an existing viewer.
+    await writer.drain()
+    header = await reader.readexactly(24)
+    width, height = int.from_bytes(header[:2], 'big'), int.from_bytes(header[2:4], 'big')
+    length = int.from_bytes(header[20:24], 'big')
+    if (width, height) != (320, 640) or length > 1024:
+        raise ValueError('VNC_DISPLAY_REFUSED')
+    await reader.readexactly(length)  # Desktop name is discarded, never logged.
+
+
 class Browser:
     """One disposable desktop; fixture network disabled, recovery network guarded."""
     def __init__(self, config=None):
@@ -36,6 +72,10 @@ class Browser:
         self.cdp = None
         self.failure = None
         self.phase = 'display_start'
+        self.vnc_phase = 'not_started'
+        self.vnc_error = None
+        self.vnc_ready_ms = None
+        self.vnc_banner_ms = None
 
     async def spawn(self, *args):
         # Do not give access tokens, Render metadata or server secrets to Chrome.
@@ -63,6 +103,30 @@ class Browser:
         await self.spawn('x11vnc', '-norc', '-display', ':99', '-listen', '127.0.0.1',
                          '-localhost', '-no6', '-rfbport', '5900', '-nopw', '-forever',
                          '-shared', '-norepeat', '-wait', '100', '-nosel', '-quiet')
+        # Probe before Chromium adds load. A connect/close probe leaves a half
+        # negotiated RFB client; complete negotiation and cleanly disconnect.
+        self.vnc_phase = 'handshake'
+        began = time.monotonic()
+        for attempt in range(150):
+            try:
+                reader, writer = await asyncio.open_connection('127.0.0.1', 5900)
+                break
+            except OSError:
+                if not self.alive() or attempt == 149:
+                    self.vnc_error = 'VNC_NOT_LISTENING'
+                    raise RuntimeError('BROWSER_UNAVAILABLE') from None
+                await asyncio.sleep(.1)
+        try:
+            await asyncio.wait_for(rfb_ready(reader, writer), 10)
+            self.vnc_ready_ms = int((time.monotonic() - began) * 1000)
+            self.vnc_phase = 'ready'
+        except Exception:
+            self.vnc_error = 'VNC_HANDSHAKE_FAILED'
+            raise
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(writer.wait_closed(), 1)
         sandbox = ['--no-sandbox'] if not self.config and os.environ.get('POC_ALLOW_UNSANDBOXED') == '1' else []
         # Closed local port discards HTTP(S); managed policy allows only fixture.html.
         # This is isolation for a fictitious page, never a provider proxy.
@@ -77,27 +141,16 @@ class Browser:
                          '--user-data-dir=' + self.directory.name + '/profile',
                          '--window-size=320,640', '--window-position=0,0',
                          '--app=' + ('about:blank' if self.config else 'file:///opt/poc/fixture.html'))
-        for _ in range(150):
-            if not self.alive():
-                raise RuntimeError('BROWSER_UNAVAILABLE')
+        await asyncio.sleep(.5)
+        if not self.alive():
+            raise RuntimeError('BROWSER_UNAVAILABLE')
+        if self.config:
+            self.cdp = CDP(self.config)
             try:
-                reader, writer = await asyncio.open_connection('127.0.0.1', 5900)
-                writer.close()
-                await writer.wait_closed()
-                await asyncio.sleep(.5)
-                if not self.alive():
-                    raise RuntimeError('BROWSER_UNAVAILABLE')
-                if self.config:
-                    self.cdp = CDP(self.config)
-                    try:
-                        await self.cdp.start()
-                    except RecoveryError as error:
-                        self.failure = error.code
-                        raise
-                return
-            except OSError:
-                await asyncio.sleep(.1)
-        raise RuntimeError('BROWSER_UNAVAILABLE')
+                await self.cdp.start()
+            except RecoveryError as error:
+                self.failure = error.code
+                raise
 
     def alive(self):
         return bool(self.processes) and all(p.returncode is None for p in self.processes)
@@ -134,10 +187,31 @@ class Browser:
             result.update(browser_product=self.cdp.browser_product,
                           worker_blocked_count=self.cdp.worker_blocked_count,
                           worker_network_failed=self.cdp.worker_network_failed)
+        result.update(vnc_phase=self.vnc_phase, vnc_error=self.vnc_error,
+                      vnc_ready_ms=self.vnc_ready_ms, vnc_banner_ms=self.vnc_banner_ms,
+                      vnc_process_alive=len(self.processes) > 1 and self.processes[1].returncode is None)
         return result
 
     async def connect(self):
-        return await asyncio.open_connection('127.0.0.1', 5900)
+        self.vnc_error = None
+        self.vnc_phase = 'viewer_banner'
+        began = time.monotonic()
+        reader, writer = await asyncio.open_connection('127.0.0.1', 5900)
+        try:
+            banner = await asyncio.wait_for(reader.readexactly(12), 10)
+            if banner != b'RFB 003.008\n':
+                self.vnc_error = 'VNC_BANNER_INVALID'
+                raise RuntimeError('BROWSER_UNAVAILABLE')
+            self.vnc_banner_ms = int((time.monotonic() - began) * 1000)
+            self.vnc_phase = 'viewer_connected'
+            return PrefixedReader(reader, banner), writer
+        except Exception:
+            self.vnc_error = self.vnc_error or 'VNC_BANNER_UNAVAILABLE'
+            print(json.dumps(self.diagnostic()), flush=True)
+            writer.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(writer.wait_closed(), 1)
+            raise
 
     async def stop(self):
         if self.cdp:
@@ -394,7 +468,7 @@ async def websocket(request):
             previous, session['ws'] = session['ws'], None
             await previous.close(code=1000, message=b'VIEW_REPLACED')
         try:
-            reader, writer = await asyncio.wait_for(session['engine'].connect(), 3)
+            reader, writer = await asyncio.wait_for(session['engine'].connect(), 12)
         except Exception:
             raise web.HTTPServiceUnavailable(text='BROWSER_UNAVAILABLE')
         ws = web.WebSocketResponse(protocols=('binary',), max_msg_size=1024 * 1024, heartbeat=20, timeout=2)
