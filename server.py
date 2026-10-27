@@ -1,4 +1,7 @@
-"""Isolated local-page benchmark. No provider login, session export or prod API."""
+"""Private desktop: isolated fixture by default, optional ticketed human recovery.
+
+No automatic credential entry, CAPTCHA solving or campaign actions.
+"""
 import asyncio
 import contextlib
 import hmac
@@ -23,7 +26,7 @@ STATE = 'fixture_gateway'
 
 
 class Browser:
-    """One fresh, disposable, network-disabled desktop per authenticated session."""
+    """One disposable desktop; fixture network disabled, recovery network guarded."""
     def __init__(self, config=None):
         self.processes = []
         self.directory = None
@@ -56,7 +59,7 @@ class Browser:
             raise RuntimeError('DISPLAY_UNAVAILABLE')
         await self.spawn('x11vnc', '-norc', '-display', ':99', '-listen', '127.0.0.1',
                          '-localhost', '-no6', '-rfbport', '5900', '-nopw', '-forever',
-                         '-shared', '-noxdamage', '-repeat', '-nosel', '-quiet')
+                         '-shared', '-norepeat', '-wait', '100', '-nosel', '-quiet')
         sandbox = ['--no-sandbox'] if not self.config and os.environ.get('POC_ALLOW_UNSANDBOXED') == '1' else []
         # Closed local port discards HTTP(S); managed policy allows only fixture.html.
         # This is isolation for a fictitious page, never a provider proxy.
@@ -361,12 +364,16 @@ async def websocket(request):
         if session['status'] != 'ready':
             raise web.HTTPConflict(text='BROWSER_NOT_READY')
         if session['ws'] is not None:
-            raise web.HTTPConflict(text='VIEW_ALREADY_OPEN')
+            # A phone reload can arrive before the proxy closes its previous WS.
+            # The verified same-session cookie may replace that viewer, never the
+            # browser. Detach first so an old handler cannot forward more input.
+            previous, session['ws'] = session['ws'], None
+            await previous.close(code=1000, message=b'VIEW_REPLACED')
         try:
             reader, writer = await asyncio.wait_for(session['engine'].connect(), 3)
         except Exception:
             raise web.HTTPServiceUnavailable(text='BROWSER_UNAVAILABLE')
-        ws = web.WebSocketResponse(protocols=('binary',), max_msg_size=1024 * 1024, heartbeat=20)
+        ws = web.WebSocketResponse(protocols=('binary',), max_msg_size=1024 * 1024, heartbeat=20, timeout=2)
         try:
             await ws.prepare(request)
         except Exception:
@@ -376,6 +383,8 @@ async def websocket(request):
 
     async def incoming():
         async for message in ws:
+            if session['ws'] is not ws:
+                break
             if message.type == WSMsgType.BINARY:
                 writer.write(message.data)
                 await writer.drain()
@@ -384,9 +393,9 @@ async def websocket(request):
                 break
 
     async def outgoing():
-        while not ws.closed:
+        while not ws.closed and session['ws'] is ws:
             data = await reader.read(65536)
-            if not data:
+            if not data or session['ws'] is not ws:
                 break
             await ws.send_bytes(data)
 
