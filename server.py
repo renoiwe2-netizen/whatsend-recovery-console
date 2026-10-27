@@ -70,6 +70,16 @@ async def rfb_ready(reader, writer, phase=None):
     await reader.readexactly(length)  # Desktop name is discarded, never logged.
 
 
+def rfb_log_summary(text):
+    """Allowlisted protocol facts only; never return native log lines."""
+    return {'protocol_38': 'Client Protocol Version 3.8' in text,
+            'none_selected': 'executing handler for type 1\n' in text,
+            'security_result_sent': 'returning securityResult for client rfb version >= 3.8' in text,
+            'client_gone': bool(re.search(r'(?:Client [^\n]+ gone|client gone)', text)),
+            'security_refused': 'wrong security type' in text,
+            'x_error': 'X Error of failed request' in text or 'XIO:  fatal IO error' in text}
+
+
 class Browser:
     """One disposable desktop; fixture network disabled, recovery network guarded."""
     def __init__(self, config=None):
@@ -89,7 +99,8 @@ class Browser:
         # Do not give access tokens, Render metadata or server secrets to Chrome.
         env = {key: os.environ[key] for key in ('PATH', 'HOME', 'LANG') if key in os.environ}
         env.update(DISPLAY=':99', TMPDIR=self.directory.name)
-        with open(Path(self.directory.name) / 'process-errors.log', 'ab') as errors:
+        log_name = 'rfb.log' if args[0] == 'x11vnc' else 'process-errors.log'
+        with open(Path(self.directory.name) / log_name, 'ab') as errors:
             process = await asyncio.create_subprocess_exec(
                 *args, env=env, stdout=asyncio.subprocess.DEVNULL,
                 stderr=errors, start_new_session=True)
@@ -110,7 +121,7 @@ class Browser:
         self.phase = 'vnc_start'
         await self.spawn('x11vnc', '-norc', '-display', ':99', '-listen', '127.0.0.1',
                          '-localhost', '-nolookup', '-no6', '-rfbport', '5900', '-nopw', '-forever',
-                         '-shared', '-norepeat', '-wait', '100', '-nosel', '-quiet')
+                         '-shared', '-norepeat', '-wait', '100', '-nosel')
         # Probe before Chromium adds load. A connect/close probe leaves a half
         # negotiated RFB client; complete negotiation and cleanly disconnect.
         self.vnc_phase = 'handshake'
@@ -201,6 +212,12 @@ class Browser:
         result.update(vnc_phase=self.vnc_phase, vnc_error=self.vnc_error,
                       vnc_ready_ms=self.vnc_ready_ms, vnc_banner_ms=self.vnc_banner_ms,
                       vnc_process_alive=len(self.processes) > 1 and self.processes[1].returncode is None)
+        if self.directory:
+            with contextlib.suppress(OSError):
+                with open(Path(self.directory.name) / 'rfb.log', 'rb') as log:
+                    # First 64 KiB contains startup and handshake. The entire
+                    # temporary log disappears when this desktop closes.
+                    result['rfb'] = rfb_log_summary(log.read(65536).decode('utf-8', errors='replace'))
         return result
 
     async def connect(self):
