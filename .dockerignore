@@ -1,0 +1,9 @@
+*
+!Dockerfile
+!bootstrap.sh
+!fixture.html
+!measure.py
+!server.py
+!index.html
+!client.js
+!chromium-policy.json

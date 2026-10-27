@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Console de démonstration</title><style>
+*{box-sizing:border-box}body{margin:0;background:#eef7f2;color:#123c32;font:16px/1.45 system-ui,sans-serif}main{max-width:740px;margin:auto;padding:12px}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px}h1{font-size:20px;margin:4px 0}p{margin:8px 0}button{font:inherit;min-height:44px;border:0;border-radius:10px;padding:10px 16px;background:#075e54;color:white;cursor:pointer}button:focus-visible{outline:3px solid #e5a500;outline-offset:3px}button[hidden],iframe[hidden]{display:none}
+#status{padding:12px;background:white;border-radius:12px}iframe{width:100%;height:calc(100dvh - 185px);min-height:360px;border:1px solid #b7d5c9;border-radius:12px;background:#182a24}small{font-size:12px}#metrics{font-variant-numeric:tabular-nums}
+</style><script src="/client.js" defer></script></head><body><main>
+<header><h1>Test de connexion mobile</h1><button id="close" hidden>Fermer</button></header>
+<p id="status" role="status">Vérification de l’accès…</p>
+<p><small>Page fictive uniquement · aucune campagne ni dépense. Le clavier tactile est dans la barre noVNC à gauche.</small></p>
+<iframe id="desktop" title="Navigateur de démonstration, page fictive" hidden allow="fullscreen"></iframe>
+<p id="metrics"><small>Le navigateur démarre uniquement après une ouverture autorisée.</small></p>
+</main></body></html>
