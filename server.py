@@ -127,8 +127,14 @@ class Browser:
 
     def diagnostic(self):
         # Only enums originating in this program; never subprocess/CDP error text.
-        return {'phase': self.cdp.phase if self.cdp else self.phase,
-                'code': (self.cdp.diagnostic_code if self.cdp else None) or self.error_code()}
+        result = {'phase': self.cdp.phase if self.cdp else self.phase,
+                  'code': ((self.cdp.diagnostic_code or (None if self.cdp.phase == 'ready' else self.error_code()))
+                           if self.cdp else self.error_code())}
+        if self.cdp:
+            result.update(browser_product=self.cdp.browser_product,
+                          worker_blocked_count=self.cdp.worker_blocked_count,
+                          worker_network_failed=self.cdp.worker_network_failed)
+        return result
 
     async def connect(self):
         return await asyncio.open_connection('127.0.0.1', 5900)
@@ -235,6 +241,8 @@ class Gateway:
             await asyncio.wait_for(session['engine'].start(), 90)
             if self.session is session:
                 session['status'] = 'ready'
+                if self.relay and hasattr(session['engine'], 'diagnostic'):
+                    print(json.dumps(session['engine'].diagnostic()), flush=True)
                 if self.relay:
                     session['monitor'] = asyncio.create_task(self.recover(session))
         except asyncio.CancelledError:
@@ -338,8 +346,11 @@ async def status(request):
 async def metrics(request):
     gateway = request.app[STATE]
     session = gateway.require_session(request)
+    diagnostic = session.get('diagnostic')
+    if session['status'] == 'ready' and hasattr(session['engine'], 'diagnostic'):
+        diagnostic = session['engine'].diagnostic()
     return web.json_response({**gateway.status(session), 'memory': snapshot(),
-                              **({'diagnostic': session['diagnostic']} if session.get('diagnostic') else {})})
+                              **({'diagnostic': diagnostic} if diagnostic else {})})
 
 
 async def close(request):

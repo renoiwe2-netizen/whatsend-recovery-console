@@ -188,6 +188,10 @@ class CDP:
         self.failed = False
         self.phase = 'created'
         self.diagnostic_code = None
+        self.browser_product = 'unknown'
+        self.worker_sessions = set()
+        self.worker_blocked_count = 0
+        self.worker_network_failed = False
 
     async def start(self):
         self.phase = 'devtools_endpoint'
@@ -210,24 +214,22 @@ class CDP:
         self.phase = 'devtools_websocket'
         self.ws = await self.client.ws_connect(url, max_msg_size=1048576)
         self.reader = asyncio.create_task(self.receive())
+        version = await self.command('Browser.getVersion')
+        product = version.get('product', '')
+        if isinstance(product, str) and re.fullmatch(r'(?:Chrome|Chromium)/[0-9]{1,4}(?:\.[0-9]{1,6}){1,3}', product):
+            self.browser_product = product
         self.phase = 'attach_page'
         await self.command('Target.setAutoAttach', {'autoAttach': True, 'waitForDebuggerOnStart': True, 'flatten': True})
         await asyncio.wait_for(self.ready.wait(), 15)
         if self.failed:
             raise RecoveryError('BROWSER_UNAVAILABLE')
+        await self.open_login()
+
+    async def open_login(self):
         self.phase = 'navigate_login'
         await self.navigate(self.config.login)
-        # Wait for native verification readiness, read a boolean only.
-        if self.config.ready:
-            self.phase = 'native_verification'
-            expression = '(function(){const e=document.querySelector(' + json.dumps(self.config.ready) + ');return !e||Boolean(e.value)})()'
-            for _ in range(40):
-                if await self.evaluate(expression) is True:
-                    break
-                await asyncio.sleep(.25)
-            else:
-                self.diagnostic_code = 'NATIVE_VERIFICATION_NOT_READY'
-                raise RecoveryError('CAPTCHA_REQUIRED')
+        # Native verification may legitimately run only during the person's
+        # submit. Show the guarded page; never inspect or execute its token.
         self.phase = 'ready'
 
     async def command(self, method, params=None, session=None):
@@ -275,7 +277,7 @@ class CDP:
                             future.set_exception(RecoveryError('BROWSER_UNAVAILABLE'))
                         else:
                             future.set_result(data.get('result', {}))
-                elif data.get('method') in ('Target.attachedToTarget', 'Fetch.requestPaused'):
+                elif data.get('method') in ('Target.attachedToTarget', 'Fetch.requestPaused', 'Network.loadingFailed'):
                     task = asyncio.create_task(self.event(data))
                     self.handlers.add(task)
                     task.add_done_callback(self.handlers.discard)
@@ -288,6 +290,12 @@ class CDP:
     async def event(self, event):
         try:
             params = event['params']
+            if event['method'] == 'Network.loadingFailed':
+                if event.get('sessionId') in self.worker_sessions:
+                    self.worker_network_failed = True
+                    if params.get('blockedReason') == 'inspector' or params.get('errorText') == 'net::ERR_BLOCKED_BY_CLIENT':
+                        self.worker_blocked_count = min(9999, self.worker_blocked_count + 1)
+                return
             if event['method'] == 'Target.attachedToTarget':
                 sid = params['sessionId']
                 target = params['targetInfo']
@@ -309,6 +317,7 @@ class CDP:
                 if target.get('type') == 'page':
                     self.primary = sid
                 if worker:
+                    self.worker_sessions.add(sid)
                     await self.command('Network.enable', session=sid)
                     await self.command('Network.setBlockedURLs', self.config.worker_network_guard(), sid)
                 else:
