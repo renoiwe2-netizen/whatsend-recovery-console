@@ -38,27 +38,35 @@ class PrefixedReader:
         return await self.reader.read(count)
 
 
-async def rfb_ready(reader, writer):
+async def rfb_ready(reader, writer, phase=None):
     """Complete a shared, no-auth loopback handshake; no input or framebuffer."""
+    def mark(value):
+        if phase:
+            phase(value)
+    mark('banner')
     banner = await reader.readexactly(12)
     if banner != b'RFB 003.008\n':
         raise ValueError('VNC_PROTOCOL_REFUSED')
     writer.write(banner)
     await writer.drain()
+    mark('security_types')
     count = (await reader.readexactly(1))[0]
     if not 1 <= count <= 16 or 1 not in await reader.readexactly(count):
         raise ValueError('VNC_SECURITY_REFUSED')
     writer.write(b'\x01')
     await writer.drain()
+    mark('security_result')
     if await reader.readexactly(4) != b'\0\0\0\0':
         raise ValueError('VNC_SECURITY_REFUSED')
     writer.write(b'\x01')  # Shared client; never evicts an existing viewer.
     await writer.drain()
+    mark('server_init')
     header = await reader.readexactly(24)
     width, height = int.from_bytes(header[:2], 'big'), int.from_bytes(header[2:4], 'big')
     length = int.from_bytes(header[20:24], 'big')
     if (width, height) != (320, 640) or length > 1024:
         raise ValueError('VNC_DISPLAY_REFUSED')
+    mark('server_name')
     await reader.readexactly(length)  # Desktop name is discarded, never logged.
 
 
@@ -101,7 +109,7 @@ class Browser:
             raise RuntimeError('DISPLAY_UNAVAILABLE')
         self.phase = 'vnc_start'
         await self.spawn('x11vnc', '-norc', '-display', ':99', '-listen', '127.0.0.1',
-                         '-localhost', '-no6', '-rfbport', '5900', '-nopw', '-forever',
+                         '-localhost', '-nolookup', '-no6', '-rfbport', '5900', '-nopw', '-forever',
                          '-shared', '-norepeat', '-wait', '100', '-nosel', '-quiet')
         # Probe before Chromium adds load. A connect/close probe leaves a half
         # negotiated RFB client; complete negotiation and cleanly disconnect.
@@ -117,11 +125,14 @@ class Browser:
                     raise RuntimeError('BROWSER_UNAVAILABLE') from None
                 await asyncio.sleep(.1)
         try:
-            await asyncio.wait_for(rfb_ready(reader, writer), 10)
+            await asyncio.wait_for(rfb_ready(reader, writer, lambda phase: setattr(self, 'vnc_phase', phase)), 10)
             self.vnc_ready_ms = int((time.monotonic() - began) * 1000)
             self.vnc_phase = 'ready'
-        except Exception:
-            self.vnc_error = 'VNC_HANDSHAKE_FAILED'
+        except Exception as error:
+            known = {'VNC_PROTOCOL_REFUSED', 'VNC_SECURITY_REFUSED', 'VNC_DISPLAY_REFUSED'}
+            self.vnc_error = (str(error) if isinstance(error, ValueError) and str(error) in known
+                              else 'VNC_HANDSHAKE_TIMEOUT' if isinstance(error, asyncio.TimeoutError)
+                              else 'VNC_HANDSHAKE_FAILED')
             raise
         finally:
             writer.close()
