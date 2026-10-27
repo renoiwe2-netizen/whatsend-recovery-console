@@ -192,6 +192,7 @@ class CDP:
         self.worker_sessions = set()
         self.worker_blocked_count = 0
         self.worker_network_failed = False
+        self.viewport = {}
 
     async def start(self):
         self.phase = 'devtools_endpoint'
@@ -223,7 +224,26 @@ class CDP:
         await asyncio.wait_for(self.ready.wait(), 15)
         if self.failed:
             raise RecoveryError('BROWSER_UNAVAILABLE')
+        await self.configure_viewport()
         await self.open_login()
+
+    async def configure_viewport(self):
+        """Fit the ordinary desktop page to the actual 320x640 VNC screen."""
+        self.phase = 'viewport_config'
+        def size(source, width='width', height='height'):
+            return {key: value for key, value in [('width', source.get(width)), ('height', source.get(height))]
+                    if type(value) in (int, float) and 0 < value <= 16384}
+        before = await self.command('Page.getLayoutMetrics', session=self.primary)
+        self.viewport['before'] = size(before.get('cssLayoutViewport', {}), 'clientWidth', 'clientHeight')
+        window = await self.command('Browser.getWindowForTarget', {'targetId': self.sessions[self.primary]})
+        self.viewport['window'] = size(window.get('bounds', {}))
+        # No user-agent, touch capability, navigator or page CSS modification.
+        # Keep desktop behavior; dimensions match the real Xvfb framebuffer.
+        await self.command('Emulation.setDeviceMetricsOverride',
+                           {'width': 320, 'height': 640, 'deviceScaleFactor': 1, 'mobile': False,
+                            'screenWidth': 320, 'screenHeight': 640}, self.primary)
+        after = await self.command('Page.getLayoutMetrics', session=self.primary)
+        self.viewport['after'] = size(after.get('cssLayoutViewport', {}), 'clientWidth', 'clientHeight')
 
     async def open_login(self):
         self.phase = 'navigate_login'
@@ -271,6 +291,9 @@ class CDP:
                                      'Page.enable': 'CDP_PAGE_REFUSED',
                                      'Runtime.runIfWaitingForDebugger': 'CDP_RESUME_REFUSED',
                                      'Page.navigate': 'CDP_NAVIGATION_REFUSED',
+                                     'Page.getLayoutMetrics': 'CDP_VIEWPORT_READ_REFUSED',
+                                     'Browser.getWindowForTarget': 'CDP_WINDOW_READ_REFUSED',
+                                     'Emulation.setDeviceMetricsOverride': 'CDP_VIEWPORT_REFUSED',
                                      'Runtime.evaluate': 'CDP_READ_REFUSED',
                                      'Network.getCookies': 'CDP_COOKIES_REFUSED'}
                             self.diagnostic_code = self.diagnostic_code or codes.get(self.pending_methods.get(data['id']), 'CDP_PROTOCOL_REFUSED')

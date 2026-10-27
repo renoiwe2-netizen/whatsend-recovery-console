@@ -210,7 +210,8 @@ class Browser:
         if self.cdp:
             result.update(browser_product=self.cdp.browser_product,
                           worker_blocked_count=self.cdp.worker_blocked_count,
-                          worker_network_failed=self.cdp.worker_network_failed)
+                          worker_network_failed=self.cdp.worker_network_failed,
+                          viewport=self.cdp.viewport)
         result.update(vnc_phase=self.vnc_phase, vnc_error=self.vnc_error,
                       vnc_ready_ms=self.vnc_ready_ms, vnc_banner_ms=self.vnc_banner_ms,
                       vnc_process_alive=len(self.processes) > 1 and self.processes[1].returncode is None)
