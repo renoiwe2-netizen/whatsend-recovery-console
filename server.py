@@ -119,9 +119,11 @@ class Browser:
         else:
             raise RuntimeError('DISPLAY_UNAVAILABLE')
         self.phase = 'vnc_start'
+        # RFB input/output must progress independently of X11 screen polling.
+        # Disable RECORD's grab-monitoring path; XDamage remains enabled.
         await self.spawn('x11vnc', '-norc', '-display', ':99', '-listen', '127.0.0.1',
                          '-localhost', '-nolookup', '-no6', '-rfbport', '5900', '-nopw', '-forever',
-                         '-shared', '-norepeat', '-wait', '100', '-nosel')
+                         '-shared', '-threads', '-noxrecord', '-norepeat', '-wait', '100', '-nosel')
         # Probe before Chromium adds load. A connect/close probe leaves a half
         # negotiated RFB client; complete negotiation and cleanly disconnect.
         self.vnc_phase = 'handshake'
