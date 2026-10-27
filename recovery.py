@@ -97,6 +97,19 @@ class Configuration:
         except (ValueError, TypeError):
             return False
 
+    def worker_network_guard(self):
+        # Dedicated workers do not expose Fetch. Network's ordered URLPattern
+        # rules run inside their renderer; deny the provider even if misconfigured
+        # among external origins. Legacy engines ignore urlPatterns but still
+        # apply urls=['*'], so unsupported versions remain closed.
+        patterns = [{'urlPattern': self.origin + '/*', 'block': True}]
+        patterns.extend({'urlPattern': origin + '/recaptcha/*', 'block': False}
+                        for origin in sorted(self.challenge_origins - {self.origin}))
+        patterns.extend({'urlPattern': origin + '/*', 'block': False}
+                        for origin in sorted(self.static_origins - self.challenge_origins - {self.origin}))
+        patterns.append({'urlPattern': '*://*:*/*', 'block': True})
+        return {'urlPatterns': patterns, 'urls': ['*']}
+
 
 class Relay:
     def __init__(self, config):
@@ -250,6 +263,8 @@ class CDP:
                         if 'error' in data:
                             codes = {'Target.setAutoAttach': 'CDP_ATTACH_REFUSED',
                                      'Fetch.enable': 'CDP_FETCH_GUARD_REFUSED',
+                                     'Network.enable': 'CDP_WORKER_NETWORK_REFUSED',
+                                     'Network.setBlockedURLs': 'CDP_WORKER_NETWORK_GUARD_REFUSED',
                                      'Network.setBypassServiceWorker': 'CDP_WORKER_GUARD_REFUSED',
                                      'Page.enable': 'CDP_PAGE_REFUSED',
                                      'Runtime.runIfWaitingForDebugger': 'CDP_RESUME_REFUSED',
@@ -286,15 +301,19 @@ class CDP:
                 allowed_worker = (worker and parsed_worker.scheme == 'https'
                     and worker_origin in self.config.challenge_origins | self.config.static_origins
                     and not parsed_worker.username and not parsed_worker.password)
-                # Native challenge workers are resumed ONLY after the exact same
-                # network interception is installed. Unsupported interception fails closed.
+                # Workers have Network but may not have Fetch. Install their
+                # deny-by-default network rules before resuming native code.
                 if (kind not in ('page', 'iframe') and not allowed_worker) or (kind == 'page' and self.primary):
                     await self.command('Target.closeTarget', {'targetId': target['targetId']})
                     return
                 if target.get('type') == 'page':
                     self.primary = sid
-                await self.command('Fetch.enable', {'patterns': [{'urlPattern': '*', 'requestStage': 'Request'}]}, sid)
-                await self.command('Network.setBypassServiceWorker', {'bypass': True}, sid)
+                if worker:
+                    await self.command('Network.enable', session=sid)
+                    await self.command('Network.setBlockedURLs', self.config.worker_network_guard(), sid)
+                else:
+                    await self.command('Fetch.enable', {'patterns': [{'urlPattern': '*', 'requestStage': 'Request'}]}, sid)
+                    await self.command('Network.setBypassServiceWorker', {'bypass': True}, sid)
                 await self.command('Target.setAutoAttach', {'autoAttach': True, 'waitForDebuggerOnStart': True, 'flatten': True}, sid)
                 if target.get('type') == 'page':
                     await self.command('Page.enable', session=sid)
