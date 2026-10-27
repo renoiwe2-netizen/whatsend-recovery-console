@@ -4,6 +4,7 @@
 !fixture.html
 !measure.py
 !server.py
+!recovery.py
 !index.html
 !client.js
 !chromium-policy.json

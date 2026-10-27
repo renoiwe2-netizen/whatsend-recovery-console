@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import web, WSMsgType
 from measure import snapshot
+from recovery import CDP, Configuration, Relay, RecoveryError, configure_policy
 
 ROOT = Path(__file__).resolve().parent
 COOKIE = 'fixture_session'
@@ -23,10 +24,13 @@ STATE = 'fixture_gateway'
 
 class Browser:
     """One fresh, disposable, network-disabled desktop per authenticated session."""
-    def __init__(self):
+    def __init__(self, config=None):
         self.processes = []
         self.directory = None
         self.oom_before = 0
+        self.config = config
+        self.cdp = None
+        self.failure = None
 
     async def spawn(self, *args):
         # Do not give access tokens, Render metadata or server secrets to Chrome.
@@ -41,7 +45,7 @@ class Browser:
     async def start(self):
         self.directory = tempfile.TemporaryDirectory(prefix='fixture-')
         self.oom_before = self.oom_count()
-        await self.spawn('Xvfb', ':99', '-screen', '0', '390x844x24', '-nolisten', 'tcp')
+        await self.spawn('Xvfb', ':99', '-screen', '0', '320x640x24', '-nolisten', 'tcp')
         for _ in range(150):
             if Path('/tmp/.X11-unix/X99').exists():
                 break
@@ -53,18 +57,19 @@ class Browser:
         await self.spawn('x11vnc', '-norc', '-display', ':99', '-listen', '127.0.0.1',
                          '-localhost', '-no6', '-rfbport', '5900', '-nopw', '-forever',
                          '-shared', '-noxdamage', '-repeat', '-nosel', '-quiet')
-        sandbox = ['--no-sandbox'] if os.environ.get('POC_ALLOW_UNSANDBOXED') == '1' else []
+        sandbox = ['--no-sandbox'] if not self.config and os.environ.get('POC_ALLOW_UNSANDBOXED') == '1' else []
         # Closed local port discards HTTP(S); managed policy allows only fixture.html.
         # This is isolation for a fictitious page, never a provider proxy.
+        network = (['--remote-debugging-address=127.0.0.1', '--remote-debugging-port=9222'] if self.config else
+                   ['--host-resolver-rules=MAP * ~NOTFOUND', '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>'])
         await self.spawn('chromium', *sandbox, '--no-first-run', '--no-default-browser-check',
                          '--disable-background-networking', '--disable-component-update',
                          '--disable-sync', '--disable-extensions', '--disable-gpu',
                          '--disable-dev-shm-usage', '--noerrdialogs', '--kiosk',
-                         '--host-resolver-rules=MAP * ~NOTFOUND',
-                         '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>',
+                         *network,
                          '--user-data-dir=' + self.directory.name + '/profile',
-                         '--window-size=390,844', '--window-position=0,0',
-                         '--app=file:///opt/poc/fixture.html')
+                         '--window-size=320,640', '--window-position=0,0',
+                         '--app=' + ('about:blank' if self.config else 'file:///opt/poc/fixture.html'))
         for _ in range(150):
             if not self.alive():
                 raise RuntimeError('BROWSER_UNAVAILABLE')
@@ -75,6 +80,13 @@ class Browser:
                 await asyncio.sleep(.5)
                 if not self.alive():
                     raise RuntimeError('BROWSER_UNAVAILABLE')
+                if self.config:
+                    self.cdp = CDP(self.config)
+                    try:
+                        await self.cdp.start()
+                    except RecoveryError as error:
+                        self.failure = error.code
+                        raise
                 return
             except OSError:
                 await asyncio.sleep(.1)
@@ -92,6 +104,8 @@ class Browser:
             return 0
 
     def error_code(self):
+        if self.failure:
+            return self.failure
         if self.oom_count() > self.oom_before:
             return 'MEMORY_LIMIT_REACHED'
         if self.directory:
@@ -108,6 +122,9 @@ class Browser:
         return await asyncio.open_connection('127.0.0.1', 5900)
 
     async def stop(self):
+        if self.cdp:
+            await self.cdp.stop()
+            self.cdp = None
         for process in reversed(self.processes):
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGTERM)
@@ -125,8 +142,8 @@ class Browser:
 
 
 class Gateway:
-    def __init__(self, token, origin, factory, lifetime, clock, novnc):
-        if not re.fullmatch(r'[a-fA-F0-9]{64}', token):
+    def __init__(self, token, origin, factory, lifetime, clock, novnc, relay=None):
+        if relay is None and not re.fullmatch(r'[a-fA-F0-9]{64}', token):
             raise ValueError('POC_ACCESS_TOKEN must contain exactly 64 hexadecimal characters')
         parsed = urlsplit(origin)
         if (parsed.username or parsed.password or parsed.query or parsed.fragment
@@ -142,6 +159,8 @@ class Gateway:
         self.novnc = Path(novnc).resolve()
         self.lock = asyncio.Lock()
         self.session = None
+        self.relay = relay
+        self.mode = 'provider' if relay else 'fixture'
 
     def require_origin(self, request):
         if request.headers.get('Origin') != self.origin:
@@ -157,7 +176,7 @@ class Gateway:
         return session
 
     def status(self, session):
-        return {'mode': 'fixture', 'status': session['status'],
+        return {'mode': self.mode, 'status': session['status'],
                 'remaining_seconds': max(0, int(session['deadline'] - self.clock())),
                 'error_code': session.get('error_code')}
 
@@ -169,9 +188,12 @@ class Gateway:
             data = await request.json()
         except (ValueError, UnicodeError):
             raise web.HTTPBadRequest(text='INVALID_REQUEST')
-        candidate = data.get('token', '') if isinstance(data, dict) else ''
-        if (not isinstance(candidate, str) or not re.fullmatch(r'[a-fA-F0-9]{64}', candidate)
-                or not hmac.compare_digest(candidate, self.token)):
+        field = 'ticket' if self.relay else 'token'
+        candidate = data.get(field, '') if isinstance(data, dict) else ''
+        pattern = r'[A-Za-z0-9_-]{43}' if self.relay else r'[a-fA-F0-9]{64}'
+        if (not isinstance(candidate, str) or not re.fullmatch(pattern, candidate)
+                or not isinstance(data, dict) or set(data) != {field}
+                or (not self.relay and not hmac.compare_digest(candidate, self.token))):
             raise web.HTTPUnauthorized(text='ACCESS_REFUSED')
         async with self.lock:
             if self.session and self.clock() >= self.session['deadline']:
@@ -180,8 +202,15 @@ class Gateway:
                 session = self.require_session(request)
                 response = web.json_response(self.status(session))
             else:
-                session = {'cookie': secrets.token_urlsafe(32), 'deadline': self.clock() + self.lifetime,
-                           'status': 'starting', 'engine': self.factory(), 'ws': None, 'task': None}
+                duration = self.lifetime
+                if self.relay:
+                    try:
+                        duration = min(duration, await self.relay.claim(candidate))
+                    except RecoveryError as error:
+                        return web.json_response({'mode': 'provider', 'status': 'error', 'error_code': error.code}, status=403)
+                session = {'cookie': secrets.token_urlsafe(32), 'deadline': self.clock() + duration,
+                           'status': 'starting', 'engine': self.factory(), 'ws': None, 'task': None,
+                           'monitor': None, 'ticket': candidate if self.relay else None, 'committed': False}
                 self.session = session
                 session['task'] = asyncio.create_task(self.launch(session))
                 response = web.json_response(self.status(session), status=202)
@@ -194,14 +223,47 @@ class Gateway:
             await asyncio.wait_for(session['engine'].start(), 90)
             if self.session is session:
                 session['status'] = 'ready'
+                if self.relay:
+                    session['monitor'] = asyncio.create_task(self.recover(session))
         except asyncio.CancelledError:
             raise
         except Exception:
             session['status'] = 'error'
             session['error_code'] = session['engine'].error_code()
             await session['engine'].stop()
+            if self.relay:
+                await self.relay.abort(session['ticket'], 'LOCAL_BROWSER_UNAVAILABLE')
 
-    async def finish(self):
+    async def recover(self, session):
+        bundle = None
+        try:
+            while self.session is session and self.clock() < session['deadline']:
+                if await session['engine'].cdp.authenticated():
+                    session['status'] = 'verifying'
+                    if session['ws'] is not None:
+                        await session['ws'].close(code=1000, message=b'VERIFYING_SESSION')
+                    bundle = await session['engine'].cdp.capture()
+                    # Close all browser processes before sending the capability bundle.
+                    await session['engine'].stop()
+                    await self.relay.complete(session['ticket'], bundle)
+                    bundle = None
+                    session['committed'] = True
+                    session['ticket'] = None
+                    session['status'] = 'connected'
+                    return
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            session['status'] = 'error'
+            session['error_code'] = error.code if isinstance(error, RecoveryError) else 'REQUEST_FAILED'
+            await session['engine'].stop()
+            if session['ticket']:
+                await self.relay.abort(session['ticket'], 'LOCAL_BROWSER_UNAVAILABLE')
+        finally:
+            bundle = None
+
+    async def finish(self, code='LOCAL_CANCELED'):
         session, self.session = self.session, None
         if not session:
             return
@@ -209,9 +271,16 @@ class Gateway:
             session['task'].cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await session['task']
+        if session.get('monitor') and not session['monitor'].done():
+            session['monitor'].cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await session['monitor']
         if session['ws'] is not None:
             await session['ws'].close(code=1000, message=b'SESSION_ENDED')
         await session['engine'].stop()
+        if self.relay and session.get('ticket') and not session.get('committed'):
+            await self.relay.abort(session['ticket'], code)
+            session['ticket'] = None
 
     async def maintenance(self):
         async with self.lock:
@@ -219,13 +288,15 @@ class Gateway:
             if not session:
                 return
             if self.clock() >= session['deadline']:
-                await self.finish()
+                await self.finish('LOCAL_LOGIN_EXPIRED')
             elif session['status'] == 'ready' and not session['engine'].alive():
                 session['status'] = 'error'
                 session['error_code'] = session['engine'].error_code()
                 if session['ws'] is not None:
                     await session['ws'].close(code=1011, message=b'BROWSER_UNAVAILABLE')
                 await session['engine'].stop()
+                if self.relay and session.get('ticket'):
+                    await self.relay.abort(session['ticket'], 'LOCAL_BROWSER_UNAVAILABLE')
 
 
 @web.middleware
@@ -351,11 +422,11 @@ async def lifecycle(app):
 
 
 def create_app(token, origin, factory=Browser, lifetime=600, clock=time.monotonic,
-               novnc='/usr/share/novnc'):
+               novnc='/usr/share/novnc', relay=None):
     app = web.Application(middlewares=[headers], client_max_size=2048)
-    app[STATE] = Gateway(token, origin, factory, lifetime, clock, novnc)
+    app[STATE] = Gateway(token, origin, factory, lifetime, clock, novnc, relay=relay)
     async def health(request):
-        return web.json_response({'ok': True, 'mode': 'fixture-only'})
+        return web.json_response({'ok': True, 'mode': 'human-recovery' if relay else 'fixture-only'})
     async def home(request):
         return web.FileResponse(ROOT / 'index.html')
     async def client(request):
@@ -373,9 +444,17 @@ if __name__ == '__main__':
         port = int(os.environ.get('PORT', '10000'))
         if not 1024 <= port <= 65535:
             raise ValueError('Invalid PORT')
+        mode = os.environ.get('RECOVERY_MODE', 'fixture')
+        if mode not in ('fixture', 'provider'):
+            raise ValueError('Invalid mode')
+        config = Configuration(os.environ) if mode == 'provider' else None
+        if config:
+            configure_policy(config)
         app = create_app(os.environ.get('POC_ACCESS_TOKEN', ''),
                          os.environ.get('POC_PUBLIC_ORIGIN') or os.environ.get('RENDER_EXTERNAL_URL', ''),
-                         lifetime=int(os.environ.get('POC_SECONDS', '600')))
-    except ValueError:
+                         lifetime=int(os.environ.get('POC_SECONDS', '600')),
+                         factory=(lambda: Browser(config)) if config else Browser,
+                         relay=Relay(config) if config else None)
+    except (ValueError, RecoveryError, OSError):
         raise SystemExit('FIXTURE_CONFIGURATION_REQUIRED: token, HTTPS origin, port or duration invalid')
     web.run_app(app, host='0.0.0.0', port=port, access_log=None, print=None)

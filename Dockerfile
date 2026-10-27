@@ -5,9 +5,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 robot
 WORKDIR /opt/poc
-COPY bootstrap.sh fixture.html measure.py server.py index.html client.js ./
+COPY bootstrap.sh fixture.html measure.py server.py recovery.py index.html client.js ./
 COPY chromium-policy.json /etc/chromium/policies/managed/fixture.json
-RUN chmod 755 bootstrap.sh && chown -R robot:robot /opt/poc
+RUN chmod 755 bootstrap.sh && chown -R robot:robot /opt/poc \
+    && chown robot:robot /etc/chromium/policies/managed/fixture.json
 USER robot
 ENV DISPLAY=:99 HOME=/home/robot PORT=10000
 EXPOSE 10000

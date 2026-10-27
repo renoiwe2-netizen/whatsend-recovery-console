@@ -1,6 +1,6 @@
 # Private mobile desktop fixture
 
-Minimal Docker benchmark: Python aiohttp, Xvfb, Chromium, x11vnc and the official noVNC touch UI. It opens **only the bundled fictitious page**. There is no external login, account data, session synchronization or production integration.
+Minimal Docker console: Python aiohttp, Xvfb, Chromium, x11vnc and the official noVNC touch UI. The default `RECOVERY_MODE=fixture` opens **only the bundled fictitious page**. An optional, separately configured `provider` mode supports administrator-initiated human login; credentials are never filled or submitted by this code.
 
 ## Render configuration
 
@@ -24,4 +24,14 @@ Authenticated `/metrics` returns cgroup memory counters and a sanitized startup 
 
 Official references: [Render Free](https://render.com/docs/free), [compute plans](https://render.com/docs/compute-plans), [WebSockets](https://render.com/docs/websocket), [noVNC mobile support](https://novnc.com/info.html).
 
-Upload allowlist: `Dockerfile`, `.dockerignore`, `bootstrap.sh`, `fixture.html`, `measure.py`, `server.py`, `index.html`, `client.js`, `chromium-policy.json`, `README.md`. No `.env`, browser profile, local Python environment or other project files.
+Upload allowlist: `Dockerfile`, `.dockerignore`, `bootstrap.sh`, `fixture.html`, `measure.py`, `server.py`, `recovery.py`, `index.html`, `client.js`, `chromium-policy.json`, `README.md`. No `.env`, browser profile, local Python environment or other project files.
+
+## Optional human recovery adapter
+
+Enable only after configuring a trusted capability relay and testing the full integration. Server-only settings: `RECOVERY_MODE=provider`, `RECOVERY_HELPER_URL`, `PROVIDER_ORIGIN`, `PROVIDER_LANDING_PATH`, `PROVIDER_PROFILE_PATH`, `PROVIDER_AUTH_MARKER`, `PROVIDER_LOGIN_FORM`. Optional settings: `PROVIDER_LOGIN_PATH`, `PROVIDER_LOGIN_SUBMIT_PATH`, `PROVIDER_NATIVE_READY_SELECTOR`; JSON arrays `PROVIDER_READ_PATHS`, `PROVIDER_ASSET_PREFIXES`, `PROVIDER_CHALLENGE_ORIGINS`, `PROVIDER_STATIC_ORIGINS`.
+
+The administrator's 43-character single-use capability is passed as `#ticket=...` and checked by the relay before any browser starts. The user signs in manually in a fresh temporary profile. Chromium keeps its sandbox; fixture sandbox overrides are ignored. Exact network allowlists permit the login and its native verification resources, never campaign submission. Native verification readiness is read only as a boolean; no CAPTCHA solution or token is extracted/injected.
+
+After a recognized authenticated screen, two read-only navigations capture account identity and origin-scoped session cookies. The browser closes before the encrypted-storage relay is called. The relay must independently verify identity and atomically commit the session. A lost acknowledgement retries the same capability and bundle at most once; no browser action is replayed. Only relay confirmation displays `connected`. Cancellation/expiry closes the temporary browser and aborts the capability; forced process loss is bounded by the relay's ten-minute lease. No passwords or browser profiles survive cleanup.
+
+The generic adapter's offline tests do not prove that a particular provider accepts cloud login. A native challenge refusal remains a refusal; this console does not evade it.

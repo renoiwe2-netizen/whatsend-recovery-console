@@ -3,6 +3,7 @@
   "URLAllowlist": ["file:///opt/poc/fixture.html"],
   "DeveloperToolsAvailability": 2,
   "PasswordManagerEnabled": false,
+  "TranslateEnabled": false,
   "SyncDisabled": true,
   "BrowserSignin": 0,
   "BrowserGuestModeEnabled": false,
