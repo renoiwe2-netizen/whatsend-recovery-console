@@ -166,14 +166,18 @@ class CDP:
         self.ws = None
         self.reader = None
         self.pending = {}
+        self.pending_methods = {}
         self.sequence = 0
         self.handlers = set()
         self.sessions = {}
         self.primary = None
         self.ready = asyncio.Event()
         self.failed = False
+        self.phase = 'created'
+        self.diagnostic_code = None
 
     async def start(self):
+        self.phase = 'devtools_endpoint'
         self.client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
         url = None
         for _ in range(150):
@@ -181,29 +185,37 @@ class CDP:
                 async with self.client.get('http://127.0.0.1:9222/json/version') as response:
                     url = (await response.json())['webSocketDebuggerUrl']
                     parsed = urlsplit(url)
-                    if parsed.scheme != 'ws' or parsed.hostname != '127.0.0.1' or parsed.port != 9222:
+                    if parsed.scheme != 'ws' or parsed.hostname not in ('127.0.0.1', 'localhost') or parsed.port != 9222:
+                        self.diagnostic_code = 'CDP_ENDPOINT_REFUSED'
                         raise RecoveryError()
                     break
             except (aiohttp.ClientError, asyncio.TimeoutError, KeyError):
                 await asyncio.sleep(.1)
         if not url:
+            self.diagnostic_code = 'CDP_ENDPOINT_UNAVAILABLE'
             raise RecoveryError('BROWSER_UNAVAILABLE')
+        self.phase = 'devtools_websocket'
         self.ws = await self.client.ws_connect(url, max_msg_size=1048576)
         self.reader = asyncio.create_task(self.receive())
+        self.phase = 'attach_page'
         await self.command('Target.setAutoAttach', {'autoAttach': True, 'waitForDebuggerOnStart': True, 'flatten': True})
         await asyncio.wait_for(self.ready.wait(), 15)
         if self.failed:
             raise RecoveryError('BROWSER_UNAVAILABLE')
+        self.phase = 'navigate_login'
         await self.navigate(self.config.login)
         # Wait for native verification readiness, read a boolean only.
         if self.config.ready:
+            self.phase = 'native_verification'
             expression = '(function(){const e=document.querySelector(' + json.dumps(self.config.ready) + ');return !e||Boolean(e.value)})()'
             for _ in range(40):
                 if await self.evaluate(expression) is True:
                     break
                 await asyncio.sleep(.25)
             else:
+                self.diagnostic_code = 'NATIVE_VERIFICATION_NOT_READY'
                 raise RecoveryError('CAPTCHA_REQUIRED')
+        self.phase = 'ready'
 
     async def command(self, method, params=None, session=None):
         if not self.ws or self.ws.closed:
@@ -212,14 +224,19 @@ class CDP:
         ident = self.sequence
         future = asyncio.get_running_loop().create_future()
         self.pending[ident] = future
+        self.pending_methods[ident] = method
         message = {'id': ident, 'method': method, 'params': params or {}}
         if session:
             message['sessionId'] = session
         await self.ws.send_json(message)
         try:
             return await asyncio.wait_for(future, 15)
+        except asyncio.TimeoutError:
+            self.diagnostic_code = self.diagnostic_code or 'CDP_TIMEOUT'
+            raise
         finally:
             self.pending.pop(ident, None)
+            self.pending_methods.pop(ident, None)
 
     async def receive(self):
         try:
@@ -231,6 +248,15 @@ class CDP:
                     future = self.pending.get(data['id'])
                     if future and not future.done():
                         if 'error' in data:
+                            codes = {'Target.setAutoAttach': 'CDP_ATTACH_REFUSED',
+                                     'Fetch.enable': 'CDP_FETCH_GUARD_REFUSED',
+                                     'Network.setBypassServiceWorker': 'CDP_WORKER_GUARD_REFUSED',
+                                     'Page.enable': 'CDP_PAGE_REFUSED',
+                                     'Runtime.runIfWaitingForDebugger': 'CDP_RESUME_REFUSED',
+                                     'Page.navigate': 'CDP_NAVIGATION_REFUSED',
+                                     'Runtime.evaluate': 'CDP_READ_REFUSED',
+                                     'Network.getCookies': 'CDP_COOKIES_REFUSED'}
+                            self.diagnostic_code = self.diagnostic_code or codes.get(self.pending_methods.get(data['id']), 'CDP_PROTOCOL_REFUSED')
                             future.set_exception(RecoveryError('BROWSER_UNAVAILABLE'))
                         else:
                             future.set_result(data.get('result', {}))
@@ -297,12 +323,17 @@ class CDP:
     async def navigate(self, path):
         result = await self.command('Page.navigate', {'url': self.config.origin + path}, self.primary)
         if result.get('errorText'):
+            error = result.get('errorText')
+            self.diagnostic_code = ('NAVIGATION_POLICY_BLOCKED' if error in ('net::ERR_BLOCKED_BY_ADMINISTRATOR', 'net::ERR_BLOCKED_BY_ADMINISTRATOR_POLICY')
+                                    else 'NAVIGATION_GUARD_BLOCKED' if error == 'net::ERR_BLOCKED_BY_CLIENT'
+                                    else 'NAVIGATION_FAILED')
             raise RecoveryError('BROWSER_UNAVAILABLE')
         for _ in range(60):
             facts = await self.evaluate('({origin:location.origin,path:location.pathname,ready:document.readyState})')
             if facts and facts.get('origin') == self.config.origin and facts.get('path') == path and facts.get('ready') in ('interactive', 'complete'):
                 return
             await asyncio.sleep(.25)
+        self.diagnostic_code = 'NAVIGATION_NOT_READY'
         raise RecoveryError('BROWSER_UNAVAILABLE')
 
     async def authenticated(self):
@@ -345,10 +376,15 @@ class CDP:
             await self.client.close()
 
 
-def configure_policy(config):
-    path = Path('/etc/chromium/policies/managed/fixture.json')
-    policy = {'URLBlocklist': ['*'], 'URLAllowlist': ['about:blank', config.origin + '/*',
-              *[origin + '/*' for origin in config.challenge_origins | config.static_origins]],
+def managed_policy(config):
+    # Enterprise URL filters are prefixes, not globs. The trailing /* is invalid.
+    # A dot before the hostname restricts matches to that exact hostname.
+    allowed = ['https://.' + urlsplit(origin).hostname for origin in {config.origin} | config.challenge_origins | config.static_origins]
+    return {'URLBlocklist': ['*'], 'URLAllowlist': ['about:blank', *sorted(allowed)],
               'PasswordManagerEnabled': False, 'TranslateEnabled': False, 'SyncDisabled': True, 'BrowserSignin': 0,
               'BrowserGuestModeEnabled': False, 'PrintingEnabled': False, 'DownloadRestrictions': 3}
-    path.write_text(json.dumps(policy), encoding='utf-8')
+
+
+def configure_policy(config):
+    path = Path('/etc/chromium/policies/managed/fixture.json')
+    path.write_text(json.dumps(managed_policy(config)), encoding='utf-8')

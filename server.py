@@ -5,6 +5,7 @@ No automatic credential entry, CAPTCHA solving or campaign actions.
 import asyncio
 import contextlib
 import hmac
+import json
 import mimetypes
 import os
 from pathlib import Path
@@ -34,6 +35,7 @@ class Browser:
         self.config = config
         self.cdp = None
         self.failure = None
+        self.phase = 'display_start'
 
     async def spawn(self, *args):
         # Do not give access tokens, Render metadata or server secrets to Chrome.
@@ -57,6 +59,7 @@ class Browser:
             await asyncio.sleep(.1)
         else:
             raise RuntimeError('DISPLAY_UNAVAILABLE')
+        self.phase = 'vnc_start'
         await self.spawn('x11vnc', '-norc', '-display', ':99', '-listen', '127.0.0.1',
                          '-localhost', '-no6', '-rfbport', '5900', '-nopw', '-forever',
                          '-shared', '-norepeat', '-wait', '100', '-nosel', '-quiet')
@@ -65,6 +68,7 @@ class Browser:
         # This is isolation for a fictitious page, never a provider proxy.
         network = (['--remote-debugging-address=127.0.0.1', '--remote-debugging-port=9222'] if self.config else
                    ['--host-resolver-rules=MAP * ~NOTFOUND', '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>'])
+        self.phase = 'chromium_start'
         await self.spawn('chromium', *sandbox, '--no-first-run', '--no-default-browser-check',
                          '--disable-background-networking', '--disable-component-update',
                          '--disable-sync', '--disable-extensions', '--disable-gpu',
@@ -120,6 +124,11 @@ class Browser:
             except OSError:
                 pass
         return 'BROWSER_UNAVAILABLE'
+
+    def diagnostic(self):
+        # Only enums originating in this program; never subprocess/CDP error text.
+        return {'phase': self.cdp.phase if self.cdp else self.phase,
+                'code': (self.cdp.diagnostic_code if self.cdp else None) or self.error_code()}
 
     async def connect(self):
         return await asyncio.open_connection('127.0.0.1', 5900)
@@ -233,6 +242,9 @@ class Gateway:
         except Exception:
             session['status'] = 'error'
             session['error_code'] = session['engine'].error_code()
+            if hasattr(session['engine'], 'diagnostic'):
+                session['diagnostic'] = session['engine'].diagnostic()
+                print(json.dumps(session['diagnostic']), flush=True)
             await session['engine'].stop()
             if self.relay:
                 await self.relay.abort(session['ticket'], 'LOCAL_BROWSER_UNAVAILABLE')
@@ -326,7 +338,8 @@ async def status(request):
 async def metrics(request):
     gateway = request.app[STATE]
     session = gateway.require_session(request)
-    return web.json_response({**gateway.status(session), 'memory': snapshot()})
+    return web.json_response({**gateway.status(session), 'memory': snapshot(),
+                              **({'diagnostic': session['diagnostic']} if session.get('diagnostic') else {})})
 
 
 async def close(request):
