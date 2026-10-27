@@ -76,6 +76,7 @@ def rfb_log_summary(text):
             'none_selected': 'executing handler for type 1\n' in text or 'Client requests security type None(1)' in text,
             'security_result_sent': 'returning securityResult for client rfb version >= 3.8' in text,
             'client_gone': bool(re.search(r'(?:Client [^\n]+ gone|client gone)', text)),
+            'blacklisted': 'Too many security failures' in text or 'blacklisted' in text.lower(),
             'security_refused': 'wrong security type' in text,
             'x_error': 'X Error of failed request' in text or 'XIO:  fatal IO error' in text}
 
@@ -95,6 +96,9 @@ class Browser:
         self.vnc_ready_ms = None
         self.vnc_banner_ms = None
         self.vnc_process = None
+        self.vnc_header_hex = None
+        self.vnc_banner_version = None
+        self.vnc_socket = None
 
     async def spawn(self, *args):
         # Do not give access tokens, Render metadata or server secrets to Chrome.
@@ -109,13 +113,17 @@ class Browser:
 
     async def start(self):
         self.directory = tempfile.TemporaryDirectory(prefix='fixture-')
+        self.vnc_socket = str(Path(self.directory.name) / 'display.sock')
         self.oom_before = self.oom_count()
         # One server owns both X display and RFB; no screen-polling bridge.
-        # RFB is loopback-only behind the capability/cookie/Origin gateway.
+        # RFB has no TCP listener: its private UNIX socket is reached through
+        # the capability/cookie/Origin gateway. Port scans cannot
+        # enter the VNC handshake or exhaust its authentication failure limit.
         await self.spawn('Xtigervnc', ':99', '-geometry', '320x640', '-depth', '24',
                          '-nolisten', 'tcp', '-noreset', '-r', '-extension', 'RECORD',
-                         '-interface', '127.0.0.1', '-localhost', '-UseIPv6=0',
-                         '-rfbport', '5900', '-SecurityTypes', 'None', '-AlwaysShared',
+                         '-localhost', '-UseIPv6=0', '-rfbport', '-1',
+                         '-rfbunixpath', self.vnc_socket, '-rfbunixmode', '0600',
+                         '-SecurityTypes', 'None', '-AlwaysShared',
                          '-DisconnectClients=0', '-AcceptSetDesktopSize=0',
                          '-AcceptCutText=0', '-SendCutText=0', '-SendPrimary=0',
                          '-AllowOverride=', '-FrameRate', '15', '-desktop', 'Private connection')
@@ -135,7 +143,7 @@ class Browser:
         began = time.monotonic()
         for attempt in range(150):
             try:
-                reader, writer = await asyncio.open_connection('127.0.0.1', 5900)
+                reader, writer = await asyncio.open_unix_connection(self.vnc_socket)
                 break
             except OSError:
                 if not self.alive() or attempt == 149:
@@ -219,7 +227,9 @@ class Browser:
                           viewport=self.cdp.viewport)
         result.update(vnc_phase=self.vnc_phase, vnc_error=self.vnc_error,
                       vnc_ready_ms=self.vnc_ready_ms, vnc_banner_ms=self.vnc_banner_ms,
+                      vnc_header_hex=self.vnc_header_hex, vnc_banner_version=self.vnc_banner_version,
                       vnc_engine='tigervnc',
+                      vnc_transport='private_unix',
                       vnc_process_alive=self.vnc_process is not None and self.vnc_process.returncode is None)
         if self.directory:
             with contextlib.suppress(OSError):
@@ -231,14 +241,23 @@ class Browser:
 
     async def connect(self):
         self.vnc_error = None
+        self.vnc_header_hex = None
+        self.vnc_banner_version = None
         self.vnc_phase = 'viewer_banner'
         began = time.monotonic()
-        reader, writer = await asyncio.open_connection('127.0.0.1', 5900)
+        if not self.vnc_socket:
+            raise RuntimeError('BROWSER_UNAVAILABLE')
+        reader, writer = await asyncio.open_unix_connection(self.vnc_socket)
         try:
             banner = await asyncio.wait_for(reader.readexactly(12), 10)
-            if banner != b'RFB 003.008\n':
+            # The initial server protocol header is public negotiation data,
+            # not framebuffer, credentials or a session token. Bound to 12 bytes.
+            self.vnc_header_hex = banner.hex()
+            version = re.fullmatch(rb'RFB (003)\.(003|007|008)\n', banner)
+            if not version:
                 self.vnc_error = 'VNC_BANNER_INVALID'
                 raise RuntimeError('BROWSER_UNAVAILABLE')
+            self.vnc_banner_version = '3.' + str(int(version.group(2)))
             self.vnc_banner_ms = int((time.monotonic() - began) * 1000)
             self.vnc_phase = 'viewer_connected'
             return PrefixedReader(reader, banner), writer
@@ -268,6 +287,7 @@ class Browser:
         if self.directory:
             self.directory.cleanup()
             self.directory = None
+            self.vnc_socket = None
 
 
 class Gateway:
