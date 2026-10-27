@@ -248,9 +248,22 @@ class CDP:
     async def open_login(self):
         self.phase = 'navigate_login'
         await self.navigate(self.config.login)
+        await self.position_login_form()
         # Native verification may legitimately run only during the person's
         # submit. Show the guarded page; never inspect or execute its token.
         self.phase = 'ready'
+
+    async def position_login_form(self):
+        # Native scroll only. Depth 0 avoids retrieving the page content or
+        # field attributes; querySelector returns a node id, never values.
+        document = await self.command('DOM.getDocument', {'depth': 0}, self.primary)
+        root = document.get('root', {}).get('nodeId')
+        if type(root) is not int or root <= 0:
+            return
+        form = await self.command('DOM.querySelector', {'nodeId': root, 'selector': self.config.form}, self.primary)
+        node = form.get('nodeId')
+        if type(node) is int and node > 0:
+            await self.command('DOM.scrollIntoViewIfNeeded', {'nodeId': node}, self.primary)
 
     async def command(self, method, params=None, session=None):
         if not self.ws or self.ws.closed:

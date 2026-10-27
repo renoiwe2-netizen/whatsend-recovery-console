@@ -72,8 +72,8 @@ async def rfb_ready(reader, writer, phase=None):
 
 def rfb_log_summary(text):
     """Allowlisted protocol facts only; never return native log lines."""
-    return {'protocol_38': 'Client Protocol Version 3.8' in text,
-            'none_selected': 'executing handler for type 1\n' in text,
+    return {'protocol_38': 'Client Protocol Version 3.8' in text or 'Client needs protocol version 3.8' in text,
+            'none_selected': 'executing handler for type 1\n' in text or 'Client requests security type None(1)' in text,
             'security_result_sent': 'returning securityResult for client rfb version >= 3.8' in text,
             'client_gone': bool(re.search(r'(?:Client [^\n]+ gone|client gone)', text)),
             'security_refused': 'wrong security type' in text,
@@ -94,12 +94,13 @@ class Browser:
         self.vnc_error = None
         self.vnc_ready_ms = None
         self.vnc_banner_ms = None
+        self.vnc_process = None
 
     async def spawn(self, *args):
         # Do not give access tokens, Render metadata or server secrets to Chrome.
         env = {key: os.environ[key] for key in ('PATH', 'HOME', 'LANG') if key in os.environ}
         env.update(DISPLAY=':99', TMPDIR=self.directory.name)
-        log_name = 'rfb.log' if args[0] == 'x11vnc' else 'process-errors.log'
+        log_name = 'rfb.log' if args[0] == 'Xtigervnc' else 'process-errors.log'
         with open(Path(self.directory.name) / log_name, 'ab') as errors:
             process = await asyncio.create_subprocess_exec(
                 *args, env=env, stdout=asyncio.subprocess.DEVNULL,
@@ -109,7 +110,16 @@ class Browser:
     async def start(self):
         self.directory = tempfile.TemporaryDirectory(prefix='fixture-')
         self.oom_before = self.oom_count()
-        await self.spawn('Xvfb', ':99', '-screen', '0', '320x640x24', '-nolisten', 'tcp')
+        # One server owns both X display and RFB; no screen-polling bridge.
+        # RFB is loopback-only behind the capability/cookie/Origin gateway.
+        await self.spawn('Xtigervnc', ':99', '-geometry', '320x640', '-depth', '24',
+                         '-nolisten', 'tcp', '-noreset', '-r', '-extension', 'RECORD',
+                         '-interface', '127.0.0.1', '-localhost', '-UseIPv6=0',
+                         '-rfbport', '5900', '-SecurityTypes', 'None', '-AlwaysShared',
+                         '-DisconnectClients=0', '-AcceptSetDesktopSize=0',
+                         '-AcceptCutText=0', '-SendCutText=0', '-SendPrimary=0',
+                         '-AllowOverride=', '-FrameRate', '15', '-desktop', 'Private connection')
+        self.vnc_process = self.processes[-1]
         for _ in range(150):
             if Path('/tmp/.X11-unix/X99').exists():
                 break
@@ -119,11 +129,6 @@ class Browser:
         else:
             raise RuntimeError('DISPLAY_UNAVAILABLE')
         self.phase = 'vnc_start'
-        # RFB input/output must progress independently of X11 screen polling.
-        # Disable RECORD's grab-monitoring path; XDamage remains enabled.
-        await self.spawn('x11vnc', '-norc', '-display', ':99', '-listen', '127.0.0.1',
-                         '-localhost', '-nolookup', '-no6', '-rfbport', '5900', '-nopw', '-forever',
-                         '-shared', '-threads', '-noxrecord', '-norepeat', '-wait', '100', '-nosel')
         # Probe before Chromium adds load. A connect/close probe leaves a half
         # negotiated RFB client; complete negotiation and cleanly disconnect.
         self.vnc_phase = 'handshake'
@@ -214,7 +219,8 @@ class Browser:
                           viewport=self.cdp.viewport)
         result.update(vnc_phase=self.vnc_phase, vnc_error=self.vnc_error,
                       vnc_ready_ms=self.vnc_ready_ms, vnc_banner_ms=self.vnc_banner_ms,
-                      vnc_process_alive=len(self.processes) > 1 and self.processes[1].returncode is None)
+                      vnc_engine='tigervnc',
+                      vnc_process_alive=self.vnc_process is not None and self.vnc_process.returncode is None)
         if self.directory:
             with contextlib.suppress(OSError):
                 with open(Path(self.directory.name) / 'rfb.log', 'rb') as log:
@@ -478,7 +484,7 @@ async def static(request):
         raise web.HTTPNotFound()
     if relative == 'vnc.html':
         html = path.read_text(encoding='utf-8')
-        # Preserve official touch keyboard; clipboard is disabled in x11vnc too.
+        # Preserve official touch keyboard; clipboard is disabled in TigerVNC too.
         html = html.replace('</head>', '<style>#noVNC_clipboard_button,#noVNC_settings_button'
                             '{display:none!important}</style></head>')
         return web.Response(text=html, content_type='text/html')

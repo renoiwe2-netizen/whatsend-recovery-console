@@ -1,6 +1,6 @@
 # Private mobile desktop fixture
 
-Minimal Docker console: Python aiohttp, Xvfb, Chromium, x11vnc and the official noVNC touch UI. The default `RECOVERY_MODE=fixture` opens **only the bundled fictitious page**. An optional, separately configured `provider` mode supports administrator-initiated human login; credentials are never filled or submitted by this code.
+Minimal Docker console: Python aiohttp, TigerVNC, Chromium and the official noVNC touch UI. The default `RECOVERY_MODE=fixture` opens **only the bundled fictitious page**. An optional, separately configured `provider` mode supports administrator-initiated human login; credentials are never filled or submitted by this code.
 
 ## Render configuration
 
