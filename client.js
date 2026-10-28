@@ -7,6 +7,8 @@ const tools = document.querySelector('#tools');
 const keyboardButton = document.querySelector('#keyboard');
 const panButton = document.querySelector('#pan');
 const hint = document.querySelector('#hint');
+const verificationLabel = document.querySelector('#verification');
+const refreshButton = document.querySelector('#refresh');
 let stopped = false, mounted = false, mode = null;
 let phase = 'starting', remainingMinutes = 10;
 let idleHint = 'Aucun envoi de campagne depuis cette fenêtre.';
@@ -84,6 +86,7 @@ function setMode(value) {
 function hideDesktop() {
   remoteObserver?.disconnect(); tools.hidden = true;
   desktop.removeAttribute('src'); desktop.hidden = true;
+  verificationLabel.hidden = true; refreshButton.hidden = true;
 }
 function finish(message) {
   stopped = true;
@@ -101,6 +104,7 @@ async function poll() {
     if (state.status === 'connected') { finish('Connexion confirmée. Reviens dans l’administration : la session est synchronisée avec le serveur.'); return; }
     if (!['starting', 'ready', 'verifying'].includes(state.status)) throw new Error('REQUEST_FAILED');
     phase = state.status; remainingMinutes = Math.ceil(state.remaining_seconds / 60);
+    if (state.status === 'starting' && mounted) { hideDesktop(); mounted = false; }
     statusLabel.textContent = state.status === 'ready'
       ? `Ouverture de l’écran distant… · ${remainingMinutes} min restantes`
       : state.status === 'verifying' ? 'Vérification et synchronisation de la connexion…' : 'Démarrage… Jusqu’à une minute sur le serveur gratuit.';
@@ -111,11 +115,24 @@ async function poll() {
       desktop.hidden = false;
     }
     if (state.status === 'ready') syncControls();
+    if (state.status === 'ready' && mode === 'provider') {
+      verificationLabel.hidden = state.verification === 'not_required';
+      verificationLabel.textContent = state.verification === 'ready'
+        ? 'Vérification prête : tu peux appuyer sur LOGIN.'
+        : state.verification === 'expired' ? 'La vérification a expiré. Recharge-la avant de te connecter.'
+        : 'La vérification n’est pas prête. Attends ou recharge-la avant de te connecter.';
+      refreshButton.hidden = false; refreshButton.disabled = false;
+    }
     const bytes = Number(state.memory?.cgroup_current_bytes);
     metricsLabel.textContent = bytes ? `Mémoire : ${(bytes / 1048576).toFixed(0)} / 512 Mio` : 'Mesure mémoire disponible sur le serveur.';
     setTimeout(poll, 2000);
   } catch (error) { finish(errors[error.message] || 'Session fermée ou expirée. Reviens dans l’administration pour recommencer.'); }
 }
+refreshButton.addEventListener('click', async () => {
+  refreshButton.disabled = true;
+  try { await request('/refresh', {method: 'POST'}); hideDesktop(); mounted = false; phase = 'starting'; statusLabel.textContent = 'Rechargement de la vérification…'; }
+  catch { refreshButton.disabled = false; verificationLabel.textContent = 'Rechargement indisponible. Termine ou ferme cette connexion.'; }
+});
 closeButton.addEventListener('click', async () => {
   closeButton.disabled = true; stopped = true;
   try { await request('/close', { method: 'POST' }); finish(mode === 'fixture' ? 'Test terminé. Le navigateur distant est fermé.' : 'Connexion fermée. Tu peux revenir dans l’administration.'); }

@@ -328,7 +328,9 @@ class Gateway:
         return session
 
     def status(self, session):
+        cdp = getattr(session['engine'], 'cdp', None)
         return {'mode': self.mode, 'status': session['status'],
+                'verification': cdp.verification_status() if cdp and hasattr(cdp, 'verification_status') else 'not_required',
                 'remaining_seconds': max(0, int(session['deadline'] - self.clock())),
                 'error_code': session.get('error_code')}
 
@@ -364,7 +366,8 @@ class Gateway:
                         return web.json_response({'mode': 'provider', 'status': 'error', 'error_code': error.code}, status=403)
                 session = {'cookie': secrets.token_urlsafe(32), 'deadline': self.clock() + duration,
                            'status': 'starting', 'engine': self.factory(), 'ws': None, 'task': None,
-                           'monitor': None, 'ticket': candidate if self.relay else None, 'committed': False}
+                           'monitor': None, 'ticket': candidate if self.relay else None, 'committed': False,
+                           '_prefill': dict(credentials) if credentials else None, 'reload_at': 0}
                 self.session = session
                 session['task'] = asyncio.create_task(self.launch(session, credentials))
                 response = web.json_response(self.status(session), status=202)
@@ -404,6 +407,8 @@ class Gateway:
             while self.session is session and self.clock() < session['deadline']:
                 if await session['engine'].cdp.authenticated():
                     session['status'] = 'verifying'
+                    if session.get('_prefill'):
+                        session['_prefill'].clear()
                     if session['ws'] is not None:
                         await session['ws'].close(code=1000, message=b'VERIFYING_SESSION')
                     bundle = await session['engine'].cdp.capture()
@@ -431,6 +436,8 @@ class Gateway:
         session, self.session = self.session, None
         if not session:
             return
+        if session.get('_prefill'):
+            session['_prefill'].clear()
         if session['task'] and not session['task'].done():
             session['task'].cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -482,6 +489,41 @@ async def headers(request, handler):
 async def status(request):
     gateway = request.app[STATE]
     return web.json_response(gateway.status(gateway.require_session(request)))
+
+
+async def refresh(request):
+    gateway = request.app[STATE]
+    gateway.require_origin(request)
+    async with gateway.lock:
+        session = gateway.require_session(request)
+        if not gateway.relay or session['status'] != 'ready' or gateway.clock()-session['reload_at'] < 10:
+            return web.json_response({'error_code': 'SESSION_BUSY'}, status=409)
+        session['reload_at'] = gateway.clock()
+        session['status'] = 'starting'
+        if session.get('monitor'):
+            session['monitor'].cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await session['monitor']
+        if session.get('ws'):
+            await session['ws'].close(code=1000, message=b'RELOADING_LOGIN')
+        async def reload_login():
+            credentials = dict(session['_prefill']) if session.get('_prefill') else None
+            try:
+                await asyncio.wait_for(session['engine'].cdp.open_login(credentials), 65)
+                if gateway.session is session:
+                    session['status'] = 'ready'
+                    session['monitor'] = asyncio.create_task(gateway.recover(session))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                session['status'] = 'error'
+                session['error_code'] = 'BROWSER_UNAVAILABLE'
+                await session['engine'].stop()
+            finally:
+                if credentials:
+                    credentials.clear()
+        session['task'] = asyncio.create_task(reload_login())
+        return web.json_response(gateway.status(session), status=202)
 
 
 async def metrics(request):
@@ -607,7 +649,7 @@ def create_app(token, origin, factory=Browser, lifetime=600, clock=time.monotoni
         return web.FileResponse(ROOT / 'client.js', headers={'Content-Type': 'text/javascript'})
     app.add_routes([web.get('/health', health), web.get('/', home), web.get('/client.js', client),
                     web.post('/session', app[STATE].begin), web.get('/status', status),
-                    web.get('/metrics', metrics), web.post('/close', close),
+                    web.get('/metrics', metrics), web.post('/close', close), web.post('/refresh', refresh),
                     web.get('/websockify', websocket), web.get('/novnc/{path:.*}', static)])
     app.cleanup_ctx.append(lifecycle)
     return app

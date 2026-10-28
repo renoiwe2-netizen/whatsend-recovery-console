@@ -7,6 +7,8 @@ header{display:flex;align-items:center;justify-content:space-between;gap:10px;pa
 </style><script src="/client.js" defer></script></head><body><main>
 <header><div><h1 id="heading">Connexion du robot</h1><p id="status" role="status">Vérification de l’accès…</p></div><button id="close" hidden>Fermer</button></header>
 <div id="tools" role="group" aria-label="Contrôles du navigateur distant" hidden><button id="keyboard" type="button" aria-pressed="false">Clavier</button><button id="pan" type="button" aria-pressed="false">Déplacer</button></div>
+<p id="verification" role="status" style="padding:6px 12px;background:white;font-size:14px" hidden></p>
+<button id="refresh" type="button" style="margin:4px 12px" hidden>Recharger la vérification</button>
 <iframe id="desktop" title="Navigateur de connexion sécurisée" hidden allow="fullscreen"></iframe>
 <footer><p id="hint">Aucun envoi de campagne depuis cette fenêtre.</p><p id="metrics">Le navigateur attend une ouverture autorisée.</p></footer>
 </main></body></html>

@@ -248,6 +248,7 @@ class CDP:
         self.verification = {'sdk': False, 'response_present': False}
         self.verification_changes = 0
         self.blocked_resources = []
+        self.verification_ready_at = None
 
     async def start(self, prefill_credentials=None):
         self.phase = 'devtools_endpoint'
@@ -302,9 +303,22 @@ class CDP:
 
     async def open_login(self, prefill_credentials=None):
         self.phase = 'navigate_login'
+        self.prefill_attempted = False
+        self.verification_ready_at = None
+        self.verification = {'sdk': False, 'response_present': False}
+        self.verification_changes = 0
         await self.navigate(self.config.login)
         await self.position_login_form()
         await self.prefill_login(prefill_credentials)
+        if self.config.ready:
+            self.phase = 'native_verification'
+            # Observe the provider's own result only. Never execute verification
+            # code, extract/inject its token, or submit the login form.
+            for _ in range(40):
+                await self.authenticated()
+                if self.verification['response_present']:
+                    break
+                await asyncio.sleep(1)
         # Native verification may legitimately run only during the person's
         # submit. Show the guarded page; never inspect or execute its token.
         self.phase = 'ready'
@@ -533,8 +547,17 @@ class CDP:
                     self.verification = facts
                     self.verification_changes += 1
                     print(json.dumps({'native_verification': facts}), flush=True)
+                if facts['response_present'] and self.verification_ready_at is None:
+                    self.verification_ready_at = time.monotonic()
             return result.get('authenticated') is True
         return result is True
+
+    def verification_status(self):
+        if not self.config.ready:
+            return 'not_required'
+        if not self.verification['response_present']:
+            return 'waiting'
+        return 'ready' if self.verification_ready_at is not None and time.monotonic()-self.verification_ready_at < 90 else 'expired'
 
     async def capture(self):
         # Two ordinary GET navigations, never the profile form submit.
