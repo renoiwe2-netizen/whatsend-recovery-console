@@ -4,6 +4,7 @@ import contextlib
 from datetime import datetime, timezone
 import json
 import os
+import time
 from pathlib import Path
 import re
 from urllib.parse import urlsplit, unquote
@@ -244,6 +245,9 @@ class CDP:
         self.viewport = {}
         self.prefill_attempted = False
         self.prefill_state = 'disabled'
+        self.verification = {'sdk': False, 'response_present': False}
+        self.verification_changes = 0
+        self.blocked_resources = []
 
     async def start(self, prefill_credentials=None):
         self.phase = 'devtools_endpoint'
@@ -411,7 +415,7 @@ class CDP:
                             future.set_exception(RecoveryError('BROWSER_UNAVAILABLE'))
                         else:
                             future.set_result(data.get('result', {}))
-                elif data.get('method') in ('Target.attachedToTarget', 'Fetch.requestPaused', 'Network.loadingFailed'):
+                elif data.get('method') in ('Target.attachedToTarget', 'Fetch.requestPaused', 'Network.loadingFailed', 'Runtime.exceptionThrown', 'Runtime.consoleAPICalled'):
                     task = asyncio.create_task(self.event(data))
                     self.handlers.add(task)
                     task.add_done_callback(self.handlers.discard)
@@ -424,6 +428,15 @@ class CDP:
     async def event(self, event):
         try:
             params = event['params']
+            if event['method'] in ('Runtime.exceptionThrown', 'Runtime.consoleAPICalled'):
+                detail = params.get('exceptionDetails', {}).get('exception', {}).get('description', '')
+                args = params.get('args', [])
+                first = args[0].get('value', '') if args else ''
+                if 'grecaptcha is not defined' in str(detail):
+                    print(json.dumps({'native_verification_error': 'SDK_NOT_AVAILABLE'}), flush=True)
+                elif isinstance(first, str) and first.startswith('reCAPTCHA failed:'):
+                    print(json.dumps({'native_verification_error': 'NATIVE_EXECUTION_FAILED'}), flush=True)
+                return
             if event['method'] == 'Network.loadingFailed':
                 if event.get('sessionId') in self.worker_sessions:
                     self.worker_network_failed = True
@@ -460,6 +473,7 @@ class CDP:
                 await self.command('Target.setAutoAttach', {'autoAttach': True, 'waitForDebuggerOnStart': True, 'flatten': True}, sid)
                 if target.get('type') == 'page':
                     await self.command('Page.enable', session=sid)
+                    await self.command('Runtime.enable', session=sid)
                 self.sessions[sid] = target['targetId']
                 await self.command('Runtime.runIfWaitingForDebugger', session=sid)
                 if sid == self.primary:
@@ -467,6 +481,15 @@ class CDP:
             else:
                 request = params['request']
                 allowed = self.config.permits(request.get('url'), request.get('method'), params.get('resourceType'))
+                if not allowed and len(self.blocked_resources) < 12:
+                    # No query, path, body, form value or token in diagnostics.
+                    host = urlsplit(request.get('url', '')).hostname or ''
+                    kind = params.get('resourceType', '')
+                    if re.fullmatch(r'[a-zA-Z0-9.-]{1,180}', host) and kind in ('Document', 'Script', 'XHR', 'Fetch', 'Other'):
+                        item = {'host': host, 'type': kind}
+                        if item not in self.blocked_resources:
+                            self.blocked_resources.append(item)
+                            print(json.dumps({'blocked_login_resource': item}), flush=True)
                 await self.command('Fetch.continueRequest' if allowed else 'Fetch.failRequest',
                                    {'requestId': params['requestId'], **({} if allowed else {'errorReason': 'BlockedByClient'})},
                                    event.get('sessionId'))
@@ -501,8 +524,17 @@ class CDP:
     async def authenticated(self):
         if self.failed:
             raise RecoveryError('BROWSER_UNAVAILABLE')
-        expression = '(location.origin===' + json.dumps(self.config.origin) + ' && document.querySelectorAll(' + json.dumps(self.config.marker) + ').length===1 && !document.querySelector(' + json.dumps(self.config.form) + '))'
-        return await self.evaluate(expression) is True
+        expression = '(()=>{const own=location.origin===' + json.dumps(self.config.origin) + ';return {authenticated:own&&document.querySelectorAll(' + json.dumps(self.config.marker) + ').length===1&&!document.querySelector(' + json.dumps(self.config.form) + '),login:own&&location.pathname===' + json.dumps(self.config.login) + ',sdk:typeof grecaptcha!=="undefined"&&typeof grecaptcha.ready==="function",response_present:own&&Boolean(document.querySelector("input#g-recaptcha-response")?.value)};})()'
+        result = await self.evaluate(expression)
+        if isinstance(result, dict):
+            if result.get('login') and self.verification_changes < 6:
+                facts = {key: result.get(key) is True for key in ('sdk', 'response_present')}
+                if facts != self.verification or self.verification_changes == 0:
+                    self.verification = facts
+                    self.verification_changes += 1
+                    print(json.dumps({'native_verification': facts}), flush=True)
+            return result.get('authenticated') is True
+        return result is True
 
     async def capture(self):
         # Two ordinary GET navigations, never the profile form submit.
