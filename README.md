@@ -24,7 +24,17 @@ Authenticated `/metrics` returns cgroup memory counters and a sanitized startup 
 
 Official references: [Render Free](https://render.com/docs/free), [compute plans](https://render.com/docs/compute-plans), [WebSockets](https://render.com/docs/websocket), [noVNC mobile support](https://novnc.com/info.html).
 
-Upload allowlist: `Dockerfile`, `.dockerignore`, `bootstrap.sh`, `fixture.html`, `measure.py`, `server.py`, `recovery.py`, `index.html`, `client.js`, `chromium-policy.json`, `README.md`. No `.env`, browser profile, local Python environment or other project files.
+Upload allowlist: `Dockerfile`, `.dockerignore`, `bootstrap.sh`, `fixture.html`, `measure.py`, `server.py`, `recovery.py`, `automation.py`, `runner-loader.mjs`, `package.json`, `index.html`, `client.js`, `chromium-policy.json`, `README.md`. No `.env`, browser profile, private task source/bundle, tests, local Python environment or other project files.
+
+## Optional private hosted tasks
+
+Server-only settings `CF_ORIGIN`, `HOSTED_RUNNER_KEY` and `HOSTED_BUNDLE_SHA256` enable the authenticated task gateway. With no key the task routes return 404. The key must be 32–128 base64url characters; the bundle hash is 64 lowercase hexadecimal characters. Never put these values in browser links or this repository.
+
+`POST /automation/run` accepts `Authorization: Bearer <server-key>` and JSON `{run_id, lease_token, mode}`. Both identifiers are UUIDs; mode is `send` or `report`. It returns 202 while active. Repeating the same run and lease returns its current state without launching a second process. `POST /automation/status` with the same authentication and `{run_id}` returns only the run identifier, a status and a safe error code. These routes refuse browser Origin headers.
+
+The generic Node 22 loader downloads business code from the private relay at `/internal/hosted`, checks the configured SHA-256 before importing it, and stores it temporarily with restricted permissions. The public repository contains no business code or account configuration. All task calls carry the same run and lease; the relay must independently bind them to one authorized task and account. Database credentials, encryption keys and passwords stay on that relay.
+
+One browser runs at a time. An active human connection blocks a task; a running task blocks a new human connection. Idle desktops close before headless Chromium starts. Chromium retains its sandbox and receives no server secrets. Tasks have a 180-second operation deadline and bounded closure; a 205-second process watchdog also removes detached Chromium groups belonging to that exact temporary run profile. The relay must enforce the shared account lease independently of this in-memory gateway. A lost submission result requires review, never an automatic second submission.
 
 ## Optional human recovery adapter
 
@@ -36,3 +46,5 @@ After a recognized authenticated screen, two read-only navigations capture accou
 
 The generic adapter's offline tests do not prove that a particular provider accepts cloud login. A native challenge refusal remains a refusal; this console does not evade it.
 
+
+Native verification readiness: observe only SDK/result presence booleans. Wait up to40seconds before showing login; show a conservative expiry warning after90seconds. Manual refresh reuses the same temporary browser and original10minute lease. It never submits login or solves verification. Optional prefill credentials remain only in private session RAM for this bounded refresh and are cleared on verification or closure; public HTTP responses never include them.

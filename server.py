@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 from aiohttp import web, WSMsgType
 from measure import snapshot
 from recovery import CDP, Configuration, Relay, RecoveryError, configure_policy
+from automation import Automation
 
 ROOT = Path(__file__).resolve().parent
 COOKIE = 'fixture_session'
@@ -313,6 +314,7 @@ class Gateway:
         self.session = None
         self.relay = relay
         self.mode = 'provider' if relay else 'fixture'
+        self.automation = None
 
     def require_origin(self, request):
         if request.headers.get('Origin') != self.origin:
@@ -350,6 +352,8 @@ class Gateway:
                 or (not self.relay and not hmac.compare_digest(candidate, self.token))):
             raise web.HTTPUnauthorized(text='ACCESS_REFUSED')
         async with self.lock:
+            if self.automation and self.automation.busy:
+                raise web.HTTPConflict(text='AUTOMATION_BUSY')
             if self.session and self.clock() >= self.session['deadline']:
                 await self.finish()
             if self.session:
@@ -634,13 +638,17 @@ async def lifecycle(app):
     with contextlib.suppress(asyncio.CancelledError):
         await task
     async with gateway.lock:
+        if gateway.automation:
+            await gateway.automation.close()
         await gateway.finish()
 
 
 def create_app(token, origin, factory=Browser, lifetime=600, clock=time.monotonic,
-               novnc='/usr/share/novnc', relay=None):
+               novnc='/usr/share/novnc', relay=None, automation_key='', automation_spawn=None):
     app = web.Application(middlewares=[headers], client_max_size=2048)
     app[STATE] = Gateway(token, origin, factory, lifetime, clock, novnc, relay=relay)
+    app[STATE].automation = Automation(app[STATE], automation_key,
+        **({'spawn': automation_spawn} if automation_spawn else {}))
     async def health(request):
         return web.json_response({'ok': True, 'mode': 'human-recovery' if relay else 'fixture-only'})
     async def home(request):
@@ -650,6 +658,8 @@ def create_app(token, origin, factory=Browser, lifetime=600, clock=time.monotoni
     app.add_routes([web.get('/health', health), web.get('/', home), web.get('/client.js', client),
                     web.post('/session', app[STATE].begin), web.get('/status', status),
                     web.get('/metrics', metrics), web.post('/close', close), web.post('/refresh', refresh),
+                    web.post('/automation/run', app[STATE].automation.begin),
+                    web.post('/automation/status', app[STATE].automation.status),
                     web.get('/websockify', websocket), web.get('/novnc/{path:.*}', static)])
     app.cleanup_ctx.append(lifecycle)
     return app
@@ -670,7 +680,8 @@ if __name__ == '__main__':
                          os.environ.get('POC_PUBLIC_ORIGIN') or os.environ.get('RENDER_EXTERNAL_URL', ''),
                          lifetime=int(os.environ.get('POC_SECONDS', '600')),
                          factory=(lambda: Browser(config)) if config else Browser,
-                         relay=Relay(config) if config else None)
+                         relay=Relay(config) if config else None,
+                         automation_key=os.environ.get('HOSTED_RUNNER_KEY', ''))
     except (ValueError, RecoveryError, OSError):
         raise SystemExit('FIXTURE_CONFIGURATION_REQUIRED: token, HTTPS origin, port or duration invalid')
     web.run_app(app, host='0.0.0.0', port=port, access_log=None, print=None)

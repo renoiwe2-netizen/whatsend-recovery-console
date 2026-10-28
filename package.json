@@ -1,0 +1,6 @@
+{
+  "name": "private-task-loader",
+  "private": true,
+  "type": "module",
+  "dependencies": {"puppeteer-core": "24.31.0"}
+}

@@ -8,3 +8,6 @@
 !index.html
 !client.js
 !chromium-policy.json
+!automation.py
+!runner-loader.mjs
+!package.json

@@ -1,3 +1,4 @@
+FROM node:22-bookworm-slim AS node-runtime
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium chromium-sandbox tigervnc-standalone-server novnc \
@@ -5,7 +6,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 robot
 WORKDIR /opt/poc
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm
+COPY package.json ./
+RUN npm install --omit=dev --ignore-scripts --no-audit --no-fund
 COPY bootstrap.sh fixture.html measure.py server.py recovery.py index.html client.js ./
+COPY automation.py runner-loader.mjs ./
 COPY chromium-policy.json /etc/chromium/policies/managed/fixture.json
 RUN chmod 755 bootstrap.sh && chown -R robot:robot /opt/poc \
     && chown robot:robot /etc/chromium/policies/managed/fixture.json
