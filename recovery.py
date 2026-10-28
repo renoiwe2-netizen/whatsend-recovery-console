@@ -1,4 +1,4 @@
-"""Human-only recovery adapter. Destinations/selectors are private server config."""
+"""Human recovery; optional private prefill, never automatic submission."""
 import asyncio
 import contextlib
 from datetime import datetime, timezone
@@ -13,6 +13,30 @@ import aiohttp
 SAFE_CODES = {'REQUEST_FAILED', 'SESSION_EXPIRED', 'SESSION_CANCELED', 'SESSION_BUSY',
               'CAPTCHA_REQUIRED', 'BROWSER_UNAVAILABLE', 'SANDBOX_UNAVAILABLE',
               'MEMORY_LIMIT_REACHED', 'CONFIGURATION_REQUIRED', 'ACCESS_REFUSED'}
+
+
+PREFILL_FUNCTION = r'''function(origin, path, action, formSelector, userSelector, passwordSelector, username, password) {
+  const form = this;
+  if (location.origin !== origin || location.pathname !== path || location.search || location.hash ||
+      !(form instanceof HTMLFormElement) || !form.isConnected || form.ownerDocument !== document ||
+      document.querySelectorAll(formSelector).length !== 1 || document.querySelector(formSelector) !== form ||
+      form.method.toLowerCase() !== 'post') return false;
+  const target = new URL(form.action, location.href);
+  if (target.origin !== origin || target.pathname !== action || target.search || target.hash) return false;
+  const users = form.querySelectorAll(userSelector), passwords = form.querySelectorAll(passwordSelector);
+  if (users.length !== 1 || passwords.length !== 1) return false;
+  const user = users[0], pass = passwords[0];
+  const writable = field => field instanceof HTMLInputElement && field.form === form &&
+    field.isConnected && !field.disabled && !field.readOnly && field.getClientRects().length > 0 &&
+    getComputedStyle(field).visibility === 'visible' && field.value === '';
+  if (user === pass || !writable(user) || !writable(pass) ||
+      !['text', 'email'].includes(user.type) || pass.type !== 'password') return false;
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+  setter.call(user, username);
+  setter.call(pass, password);
+  // Deliberately no input/change/keyboard event, click, submit, or token access.
+  return true;
+}'''
 
 
 class RecoveryError(Exception):
@@ -55,6 +79,13 @@ class Configuration:
         self.marker = env.get('PROVIDER_AUTH_MARKER', '')
         self.form = env.get('PROVIDER_LOGIN_FORM', '')
         self.ready = env.get('PROVIDER_NATIVE_READY_SELECTOR', '')
+        self.prefill_enabled = env.get('PROVIDER_PREFILL_ENABLED') == '1'
+        self.username_selector = env.get('PROVIDER_USERNAME_SELECTOR', 'input[name="username"]')
+        self.password_selector = env.get('PROVIDER_PASSWORD_SELECTOR', 'input[name="password"]')
+        if self.prefill_enabled and any(not isinstance(value, str) or not re.fullmatch(
+                r'input\[(?:name|id)="[A-Za-z][A-Za-z0-9_-]{0,63}"\]', value)
+                for value in (self.username_selector, self.password_selector)):
+            raise RecoveryError('CONFIGURATION_REQUIRED')
         if any(not value or len(value) > 250 for value in (self.marker, self.form)):
             raise RecoveryError('CONFIGURATION_REQUIRED')
         try:
@@ -121,14 +152,20 @@ class Relay:
         body = json.dumps({'action': action, 'ticket': ticket, **extra}, separators=(',', ':'))
         if len(body.encode()) > 32768:
             raise RecoveryError()
+        request_headers = {'Content-Type': 'application/json'}
+        relay_key = os.environ.get('RECOVERY_RELAY_KEY', '') if action == 'claim' and self.config.prefill_enabled else ''
+        if relay_key:
+            if not re.fullmatch(r'[A-Za-z0-9_-]{43}', relay_key):
+                raise RecoveryError('CONFIGURATION_REQUIRED')
+            request_headers['X-Recovery-Relay-Key'] = relay_key
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40)) as client:
-                async with client.post(self.config.helper, data=body, headers={'Content-Type': 'application/json'},
+                async with client.post(self.config.helper, data=body, headers=request_headers,
                                        allow_redirects=False) as response:
                     raw = bytearray()
                     async for chunk in response.content.iter_chunked(1024):
                         raw.extend(chunk)
-                        if len(raw) > 2048:
+                        if len(raw) > (8192 if relay_key else 2048):
                             raise RecoveryError()
                     result = json.loads(raw)
                     if response.status >= 300:
@@ -137,9 +174,14 @@ class Relay:
                 raise RecoveryError(result.get('code', 'REQUEST_FAILED') if isinstance(result, dict) else 'REQUEST_FAILED')
             if result.get('status') not in ('starting', 'connected', 'canceled'):
                 raise RecoveryError()
+            if 'private_credentials' in result and not relay_key:
+                raise RecoveryError('ACCESS_REFUSED')
             return result
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
             raise RecoveryError() from None
+        finally:
+            request_headers.clear()
+            relay_key = None
 
     async def claim(self, ticket):
         result = await self.call('claim', ticket)
@@ -151,7 +193,14 @@ class Relay:
             raise RecoveryError('SESSION_EXPIRED') from None
         if not 0 < seconds <= 605:
             raise RecoveryError('SESSION_EXPIRED')
-        return min(seconds, 600)
+        credentials = result.pop('private_credentials', None)
+        if credentials is not None:
+            if (not self.config.prefill_enabled or not isinstance(credentials, dict) or
+                    set(credentials) != {'username', 'password'} or
+                    not isinstance(credentials['username'], str) or not 1 <= len(credentials['username']) <= 320 or
+                    not isinstance(credentials['password'], str) or not 1 <= len(credentials['password']) <= 4096):
+                raise RecoveryError('ACCESS_REFUSED')
+        return min(seconds, 600), credentials
 
     async def complete(self, ticket, session):
         # Exact same capability+bundle on retry; server CAS makes ACK loss idempotent.
@@ -172,7 +221,7 @@ class Relay:
 
 
 class CDP:
-    """Ordinary debugging transport. No credential writes or CAPTCHA token access."""
+    """Ordinary debugging transport. Optional prefill; no submit or CAPTCHA access."""
     def __init__(self, config):
         self.config = config
         self.client = None
@@ -193,8 +242,10 @@ class CDP:
         self.worker_blocked_count = 0
         self.worker_network_failed = False
         self.viewport = {}
+        self.prefill_attempted = False
+        self.prefill_state = 'disabled'
 
-    async def start(self):
+    async def start(self, prefill_credentials=None):
         self.phase = 'devtools_endpoint'
         self.client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
         url = None
@@ -225,7 +276,7 @@ class CDP:
         if self.failed:
             raise RecoveryError('BROWSER_UNAVAILABLE')
         await self.configure_viewport()
-        await self.open_login()
+        await self.open_login(prefill_credentials)
 
     async def configure_viewport(self):
         """Fit the ordinary desktop page to the actual 320x640 VNC screen."""
@@ -245,13 +296,60 @@ class CDP:
         after = await self.command('Page.getLayoutMetrics', session=self.primary)
         self.viewport['after'] = size(after.get('cssLayoutViewport', {}), 'clientWidth', 'clientHeight')
 
-    async def open_login(self):
+    async def open_login(self, prefill_credentials=None):
         self.phase = 'navigate_login'
         await self.navigate(self.config.login)
         await self.position_login_form()
+        await self.prefill_login(prefill_credentials)
         # Native verification may legitimately run only during the person's
         # submit. Show the guarded page; never inspect or execute its token.
         self.phase = 'ready'
+
+    async def prefill_login(self, credentials=None):
+        if self.prefill_attempted or not self.config.prefill_enabled:
+            return
+        # One attempt before the viewer opens, never after a person's edits or
+        # failed login. Secrets arrive through the private server claim only,
+        # not Render credential env, Configuration/CDP or Chrome environment.
+        # Drop these temporary Python references finally;
+        # Python strings cannot guarantee zeroisation of allocator memory.
+        self.prefill_attempted = True
+        self.prefill_state = 'skipped'
+        source = credentials if isinstance(credentials, dict) else {}
+        username = source.get('username', '')
+        password = source.get('password', '')
+        parameters = None
+        try:
+            if (not isinstance(username, str) or not isinstance(password, str) or
+                    not 1 <= len(username) <= 320 or not 1 <= len(password) <= 4096 or
+                    any(char in username + password for char in ('\0', '\r', '\n'))):
+                self.prefill_state = 'configuration_missing'
+                return
+            # Obtain a remote form object only at the expected document. If the
+            # page navigates afterwards, the object becomes invalid; the atomic
+            # function below also rechecks every boundary before writing.
+            expression = ('(()=>{if(location.origin!==' + json.dumps(self.config.origin) +
+                '||location.pathname!==' + json.dumps(self.config.login) +
+                '||location.search||location.hash)return null;const f=document.querySelectorAll(' +
+                json.dumps(self.config.form) + ');return f.length===1?f[0]:null;})()')
+            candidate = await self.command('Runtime.evaluate', {'expression': expression,
+                'objectGroup': 'private-prefill', 'returnByValue': False, 'silent': True}, self.primary)
+            object_id = candidate.get('result', {}).get('objectId')
+            if candidate.get('exceptionDetails') or not isinstance(object_id, str):
+                return
+            parameters = {'objectId': object_id, 'functionDeclaration': PREFILL_FUNCTION,
+                'arguments': [{'value': value} for value in (self.config.origin, self.config.login,
+                    self.config.submit, self.config.form, self.config.username_selector,
+                    self.config.password_selector, username, password)], 'returnByValue': True, 'silent': True}
+            result = await self.command('Runtime.callFunctionOn', parameters, self.primary)
+            if not result.get('exceptionDetails') and result.get('result', {}).get('value') is True:
+                self.prefill_state = 'filled'
+        finally:
+            if parameters:
+                parameters['arguments'].clear()
+            username = password = None
+            with contextlib.suppress(Exception):
+                await self.command('Runtime.releaseObjectGroup', {'objectGroup': 'private-prefill'}, self.primary)
 
     async def position_login_form(self):
         # Native scroll only. Depth 0 avoids retrieving the page content or

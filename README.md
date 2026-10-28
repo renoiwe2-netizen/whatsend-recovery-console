@@ -1,6 +1,6 @@
 # Private mobile desktop fixture
 
-Minimal Docker console: Python aiohttp, TigerVNC, Chromium and the official noVNC touch UI. The default `RECOVERY_MODE=fixture` opens **only the bundled fictitious page**. An optional, separately configured `provider` mode supports administrator-initiated human login; credentials are never filled or submitted by this code.
+Minimal Docker console: Python aiohttp, TigerVNC, Chromium and the official noVNC touch UI. The default `RECOVERY_MODE=fixture` opens **only the bundled fictitious page**. An optional, separately configured `provider` mode supports administrator-initiated human login; optional server-authorized credential prefill is supported; submission remains manual.
 
 ## Render configuration
 
@@ -18,7 +18,7 @@ Only `/health`, `/` and `/client.js` are public. Desktop assets, memory measurem
 
 ## Verify before calling it usable
 
-Render Free has **512 MB RAM and 0.1 CPU**, sleeps after inactivity, and uses ephemeral storage. This package's HTTP/session tests do not prove Chromium fits that budget or performs well on a phone. Measure the container, interact with the fixture on 320px and 390px screens, and confirm automatic closure. Cold starts can be slow. Do not attach real credentials to this experiment.
+Render Free has **512 MB RAM and 0.1 CPU**, sleeps after inactivity, and uses ephemeral storage. This package's HTTP/session tests do not prove Chromium fits that budget or performs well on a phone. Measure the container, interact with the fixture on 320px and 390px screens, and confirm automatic closure. Cold starts can be slow. Provider use requires the private relay configuration below.
 
 Authenticated `/metrics` returns cgroup memory counters and a sanitized startup failure code. It never returns raw process logs. Codes include `SANDBOX_UNAVAILABLE`, `MEMORY_LIMIT_REACHED` and `BROWSER_UNAVAILABLE`.
 
@@ -30,8 +30,9 @@ Upload allowlist: `Dockerfile`, `.dockerignore`, `bootstrap.sh`, `fixture.html`,
 
 Enable only after configuring a trusted capability relay and testing the full integration. Server-only settings: `RECOVERY_MODE=provider`, `RECOVERY_HELPER_URL`, `PROVIDER_ORIGIN`, `PROVIDER_LANDING_PATH`, `PROVIDER_PROFILE_PATH`, `PROVIDER_AUTH_MARKER`, `PROVIDER_LOGIN_FORM`. Optional settings: `PROVIDER_LOGIN_PATH`, `PROVIDER_LOGIN_SUBMIT_PATH`, `PROVIDER_NATIVE_READY_SELECTOR`; JSON arrays `PROVIDER_READ_PATHS`, `PROVIDER_ASSET_PREFIXES`, `PROVIDER_CHALLENGE_ORIGINS`, `PROVIDER_STATIC_ORIGINS`.
 
-The administrator's 43-character single-use capability is passed as `#ticket=...` and checked by the relay before any browser starts. The user signs in manually in a fresh temporary profile. Chromium keeps its sandbox; fixture sandbox overrides are ignored. Exact network allowlists permit the login and its native verification resources, never campaign submission. Native verification readiness is read only as a boolean; no CAPTCHA solution or token is extracted/injected.
+The administrator's 43-character single-use capability is passed as `#ticket=...` and checked by the relay before any browser starts. The user signs in manually in a fresh temporary profile. Optional `PROVIDER_PREFILL_ENABLED=1` obtains existing credentials from the private relay using server-only `RECOVERY_RELAY_KEY`. Only the exact empty login form is filled once, before the viewer opens; no click, submit or verification is automated. Credentials are not stored in Render environment variables, returned by browser APIs or passed into Chromium environment. Chromium keeps its sandbox; fixture sandbox overrides are ignored. Exact network allowlists permit the login and its native verification resources, never campaign submission. Native verification readiness is read only as a boolean; no CAPTCHA solution or token is extracted/injected.
 
 After a recognized authenticated screen, two read-only navigations capture account identity and origin-scoped session cookies. The browser closes before the encrypted-storage relay is called. The relay must independently verify identity and atomically commit the session. A lost acknowledgement retries the same capability and bundle at most once; no browser action is replayed. Only relay confirmation displays `connected`. Cancellation/expiry closes the temporary browser and aborts the capability; forced process loss is bounded by the relay's ten-minute lease. No passwords or browser profiles survive cleanup.
 
 The generic adapter's offline tests do not prove that a particular provider accepts cloud login. A native challenge refusal remains a refusal; this console does not evade it.
+

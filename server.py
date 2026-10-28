@@ -1,6 +1,6 @@
 """Private desktop: isolated fixture by default, optional ticketed human recovery.
 
-No automatic credential entry, CAPTCHA solving or campaign actions.
+Optional private credential prefill; no submit, CAPTCHA solving or campaign actions.
 """
 import asyncio
 import contextlib
@@ -111,7 +111,7 @@ class Browser:
                 stderr=errors, start_new_session=True)
         self.processes.append(process)
 
-    async def start(self):
+    async def start(self, prefill_credentials=None):
         self.directory = tempfile.TemporaryDirectory(prefix='fixture-')
         self.vnc_socket = str(Path(self.directory.name) / 'display.sock')
         self.oom_before = self.oom_count()
@@ -184,7 +184,7 @@ class Browser:
         if self.config:
             self.cdp = CDP(self.config)
             try:
-                await self.cdp.start()
+                await self.cdp.start(prefill_credentials)
             except RecoveryError as error:
                 self.failure = error.code
                 raise
@@ -224,7 +224,10 @@ class Browser:
             result.update(browser_product=self.cdp.browser_product,
                           worker_blocked_count=self.cdp.worker_blocked_count,
                           worker_network_failed=self.cdp.worker_network_failed,
-                          viewport=self.cdp.viewport)
+                          viewport=self.cdp.viewport,
+                          prefill_enabled=self.cdp.config.prefill_enabled,
+                          prefill_attempted=self.cdp.prefill_attempted,
+                          prefill_filled=self.cdp.prefill_state == 'filled')
         result.update(vnc_phase=self.vnc_phase, vnc_error=self.vnc_error,
                       vnc_ready_ms=self.vnc_ready_ms, vnc_banner_ms=self.vnc_banner_ms,
                       vnc_header_hex=self.vnc_header_hex, vnc_banner_version=self.vnc_banner_version,
@@ -352,24 +355,28 @@ class Gateway:
                 response = web.json_response(self.status(session))
             else:
                 duration = self.lifetime
+                credentials = None
                 if self.relay:
                     try:
-                        duration = min(duration, await self.relay.claim(candidate))
+                        seconds, credentials = await self.relay.claim(candidate)
+                        duration = min(duration, seconds)
                     except RecoveryError as error:
                         return web.json_response({'mode': 'provider', 'status': 'error', 'error_code': error.code}, status=403)
                 session = {'cookie': secrets.token_urlsafe(32), 'deadline': self.clock() + duration,
                            'status': 'starting', 'engine': self.factory(), 'ws': None, 'task': None,
                            'monitor': None, 'ticket': candidate if self.relay else None, 'committed': False}
                 self.session = session
-                session['task'] = asyncio.create_task(self.launch(session))
+                session['task'] = asyncio.create_task(self.launch(session, credentials))
                 response = web.json_response(self.status(session), status=202)
             response.set_cookie(COOKIE, session['cookie'], max_age=self.lifetime,
                                 httponly=True, secure=self.secure, samesite='Strict', path='/')
             return response
 
-    async def launch(self, session):
+    async def launch(self, session, credentials=None):
         try:
-            await asyncio.wait_for(session['engine'].start(), 90)
+            startup = (session['engine'].start(prefill_credentials=credentials) if credentials is not None
+                       else session['engine'].start())
+            await asyncio.wait_for(startup, 90)
             if self.session is session:
                 session['status'] = 'ready'
                 if self.relay and hasattr(session['engine'], 'diagnostic'):
@@ -387,6 +394,9 @@ class Gateway:
             await session['engine'].stop()
             if self.relay:
                 await self.relay.abort(session['ticket'], 'LOCAL_BROWSER_UNAVAILABLE')
+        finally:
+            if isinstance(credentials, dict):
+                credentials.clear()
 
     async def recover(self, session):
         bundle = None
