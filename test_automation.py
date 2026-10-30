@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from aiohttp.test_utils import TestClient, TestServer
 from server import create_app, STATE
-from automation import owned_browser_groups
+from automation import owned_browser_groups, managed_processes_closed, memory_counters, cleanup_task_files, Automation
 
 KEY = 'a' * 43
 TOKEN = 'ab' * 32
@@ -76,7 +76,13 @@ class AutomationTests(unittest.IsolatedAsyncioTestCase):
         self.kill_patch = patch('automation.os.killpg', side_effect=kill, create=True)
         self.signal_patch = patch('automation.signal.SIGKILL', 9, create=True)
         self.groups_patch = patch('automation.owned_browser_groups', return_value=set())
+        self.closed_patch = patch('automation.managed_processes_closed', return_value=True)
+        self.cleanup_patch = patch('automation.cleanup_task_files')
+        self.memory_patch = patch('automation.memory_counters', return_value={})
         self.groups_patch.start()
+        self.closed_patch.start()
+        self.cleanup_mock = self.cleanup_patch.start()
+        self.memory_patch.start()
         self.signal_patch.start()
         self.kill_patch.start()
         self.auth = {'Authorization': 'Bearer ' + KEY}
@@ -86,6 +92,9 @@ class AutomationTests(unittest.IsolatedAsyncioTestCase):
         self.kill_patch.stop()
         self.signal_patch.stop()
         self.groups_patch.stop()
+        self.closed_patch.stop()
+        self.cleanup_patch.stop()
+        self.memory_patch.stop()
 
     async def begin(self, **overrides):
         data = {'run_id': RUN, 'lease_token': LEASE, **overrides}
@@ -244,6 +253,67 @@ class AutomationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([pid for pid, _ in self.kills], [99999999, 99999998])
         self.assertEqual(self.automation.records[RUN]['status'], 'report_settlement_uncertain')
 
+    async def test_status_proves_supervised_closure_only_after_exit_and_scan(self):
+        await self.begin()
+        response = await self.client.post('/automation/status', headers=self.auth, json={'run_id': RUN})
+        self.assertFalse((await response.json())['process_closed'])
+        await self.finish({'status': 'idle'})
+        response = await self.client.post('/automation/status', headers=self.auth, json={'run_id': RUN})
+        result = await response.json()
+        self.assertEqual(result['status'], 'idle')
+        self.assertTrue(result['process_closed'])
+        self.assertEqual(result['closure_source'], 'supervisor')
+        self.assertEqual(result['exit_code'], 0)
+        self.assertRegex(result['boot_id'], r'^[a-f0-9-]{36}$')
+        self.cleanup_mock.assert_called_once_with(RUN)
+        with patch('automation.managed_processes_closed', return_value=False):
+            response = await self.client.post('/automation/status', headers=self.auth, json={'run_id': RUN})
+            self.assertFalse((await response.json())['process_closed'])
+
+    async def test_unknown_run_after_restart_requires_a_fresh_idle_process_scan(self):
+        response = await self.client.post('/automation/status', headers=self.auth, json={'run_id': RUN})
+        result = await response.json()
+        self.assertEqual(result['status'], 'unknown')
+        self.assertTrue(result['process_closed'])
+        self.assertEqual(result['closure_source'], 'fresh_proc_scan')
+        self.assertEqual(self.processes, [])
+        self.assertEqual(self.kills, [])
+        self.assertNotEqual(self.automation.boot_id, Automation(self.gateway).boot_id)
+        for state in ('process-present', 'scan-error', 'human-busy', 'automation-busy'):
+            with self.subTest(state=state):
+                self.gateway.session = {'status': 'ready'} if state == 'human-busy' else None
+                self.automation.active_run = OTHER if state == 'automation-busy' else None
+                with patch('automation.managed_processes_closed', return_value=state not in ('process-present', 'scan-error')):
+                    response = await self.client.post('/automation/status', headers=self.auth, json={'run_id': RUN})
+                    self.assertFalse((await response.json())['process_closed'])
+        self.gateway.session = None
+        self.automation.active_run = None
+
+    async def test_status_refuses_browser_origin_and_unauthenticated_reads(self):
+        for headers, expected in [({}, 401), ({**self.auth, 'Origin': ORIGIN}, 403)]:
+            response = await self.client.post('/automation/status', headers=headers, json={'run_id': RUN})
+            self.assertEqual(response.status, expected)
+        self.assertEqual(self.processes, [])
+        self.assertEqual(self.kills, [])
+
+    async def test_a_known_run_cannot_claim_closure_without_supervisor_exit_proof(self):
+        self.automation.records[RUN] = {'run_id': RUN, 'status': 'failed', 'process_closed': False}
+        response = await self.client.post('/automation/status', headers=self.auth, json={'run_id': RUN})
+        self.assertFalse((await response.json())['process_closed'])
+
+    async def test_cgroup_oom_is_numeric_metadata_and_never_a_retry(self):
+        with patch('automation.memory_counters', side_effect=[{'oom_kill': 3}, {'oom_kill': 4, 'limit_bytes': 536870912, 'peak_bytes': 536870912}]):
+            await self.begin()
+            await self.finish({'status': 'failed', 'code': 'HOSTED_RUNNER_FAILED'}, code=-9)
+        response = await self.client.post('/automation/status', headers=self.auth, json={'run_id': RUN})
+        result = await response.json()
+        self.assertEqual(result['code'], 'HOSTED_MEMORY_LIMIT_REACHED')
+        self.assertEqual(result['memory']['oom_kill_delta'], 1)
+        self.assertEqual(result['memory']['limit_bytes'], 512 * 1024 * 1024)
+        self.assertTrue(result['process_closed'])
+        self.assertEqual((await self.begin()).status, 200)
+        self.assertEqual(len(self.processes), 1)
+
 
 class ProcessScopeTests(unittest.TestCase):
     def test_proc_scan_matches_only_the_owned_exact_task_profile(self):
@@ -263,6 +333,54 @@ class ProcessScopeTests(unittest.TestCase):
             with patch('automation.os.getpgrp', return_value=999, create=True):
                 self.assertEqual(owned_browser_groups(RUN, root, uid), {301})
                 self.assertEqual(owned_browser_groups(RUN, root, uid + 1), set())
+
+    def test_fresh_scan_refuses_any_owned_loader_or_any_private_task_browser(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / '201'
+            directory.mkdir()
+            uid = directory.stat().st_uid
+            arguments = [b'node\0/opt/poc/runner-loader.mjs\0',
+                         b'chromium\0--user-data-dir=/tmp/private-task-' + OTHER.encode() + b'-abcdef/profile\0']
+            for value in arguments:
+                (directory / 'cmdline').write_bytes(value)
+                self.assertFalse(managed_processes_closed(root, uid))
+                self.assertTrue(managed_processes_closed(root, uid + 1))
+            (directory / 'cmdline').write_bytes(b'python3\0/opt/poc/server.py\0')
+            self.assertTrue(managed_processes_closed(root, uid))
+            (directory / 'cmdline').unlink()
+            self.assertFalse(managed_processes_closed(root, uid))
+            self.assertFalse(managed_processes_closed(root / 'missing', uid))
+            with patch.object(Path, 'read_bytes', side_effect=PermissionError('private detail')):
+                self.assertFalse(managed_processes_closed(root, uid))
+
+    def test_cleanup_is_exact_run_and_owner_scoped(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            current = root / ('private-task-' + RUN + '-abcdef')
+            foreign = root / ('private-task-' + OTHER + '-abcdef')
+            for directory in (current, foreign):
+                directory.mkdir()
+                (directory / 'media').mkdir()
+                (directory / 'media' / 'synthetic.bin').write_bytes(b'private temporary fixture')
+            uid = current.stat().st_uid
+            with self.assertRaises(ValueError):
+                cleanup_task_files(RUN, root, uid + 1)
+            self.assertTrue(current.exists())
+            cleanup_task_files(RUN, root, uid)
+            self.assertFalse(current.exists())
+            self.assertTrue(foreign.exists())
+            with self.assertRaises(ValueError):
+                cleanup_task_files('../escape', root, uid)
+
+    def test_memory_projection_ignores_raw_values_and_unknown_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, value in {'memory.current': '500', 'memory.peak': '800', 'memory.max': '536870912',
+                                'memory.events': 'oom 1\noom_kill 1\nmax 2\nPRIVATE_SECRET 3\n'}.items():
+                (root / name).write_text(value)
+            self.assertEqual(memory_counters(root), {'current_bytes': 500, 'peak_bytes': 800, 'limit_bytes': 536870912,
+                                                     'oom': 1, 'oom_kill': 1, 'max': 2})
 
 
 if __name__ == '__main__':

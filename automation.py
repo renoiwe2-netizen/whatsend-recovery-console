@@ -7,6 +7,8 @@ import json
 import os
 import re
 import signal
+import shutil
+import uuid
 from pathlib import Path
 
 from aiohttp import web
@@ -15,6 +17,68 @@ UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 CODE = re.compile(r'[A-Z][A-Z0-9_]{0,99}')
 FINAL_STATUSES = {'submitted', 'report_pending', 'report_applied', 'failed',
                   'idle', 'report_settlement_uncertain', 'import_reconciled'}
+
+
+def managed_processes_closed(proc_root=Path('/proc'), uid=None):
+    """Fail closed unless every same-UID managed task/browser is absent."""
+    try:
+        uid = os.getuid() if uid is None else uid
+        directories = list(proc_root.iterdir())
+        for directory in directories:
+            if not directory.name.isdigit():
+                continue
+            try:
+                if directory.stat().st_uid != uid:
+                    continue
+                arguments = (directory / 'cmdline').read_bytes().split(b'\0')
+                if any(argument.rsplit(b'/', 1)[-1] == b'runner-loader.mjs' or
+                       re.fullmatch(rb'--user-data-dir=/tmp/private-task-[0-9a-f-]{36}-[A-Za-z0-9_-]{1,64}/profile', argument)
+                       for argument in arguments):
+                    return False
+            except FileNotFoundError:
+                # A process may disappear during /proc traversal. A still-live
+                # entry with unreadable/missing arguments is not closure proof.
+                if directory.exists():
+                    return False
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def memory_counters(root=Path('/sys/fs/cgroup')):
+    """Only numeric kernel counters; never process arguments or raw errors."""
+    values = {}
+    for name, field in [('memory.current', 'current_bytes'), ('memory.peak', 'peak_bytes'),
+                        ('memory.max', 'limit_bytes')]:
+        try:
+            value = (root / name).read_text().strip()
+            if value.isdecimal():
+                values[field] = int(value)
+        except OSError:
+            pass
+    try:
+        for line in (root / 'memory.events').read_text().splitlines():
+            key, value = line.split()
+            if key in ('oom', 'oom_kill', 'max') and value.isdecimal():
+                values[key] = int(value)
+    except (OSError, ValueError):
+        pass
+    return values
+
+
+def cleanup_task_files(run_id, parent=Path('/tmp'), uid=None):
+    """Remove only this closed task's same-owner private temporary directory."""
+    if not UUID.fullmatch(run_id):
+        raise ValueError('INVALID_TASK_DIRECTORY')
+    uid = os.getuid() if uid is None else uid
+    parent = parent.resolve(strict=True)
+    pattern = re.compile(r'private-task-' + re.escape(run_id) + r'-[A-Za-z0-9_-]{1,64}')
+    for directory in parent.iterdir():
+        if not pattern.fullmatch(directory.name):
+            continue
+        if directory.is_symlink() or not directory.is_dir() or directory.stat().st_uid != uid or directory.resolve().parent != parent:
+            raise ValueError('INVALID_TASK_DIRECTORY')
+        shutil.rmtree(directory)
 
 
 def owned_browser_groups(run_id, proc_root=Path('/proc'), uid=None):
@@ -49,6 +113,7 @@ class Automation:
         self.gateway, self.key, self.spawn = gateway, key, spawn
         self.timeout, self.runner = timeout, runner
         self.records, self.active_run, self.blocked = {}, None, False
+        self.boot_id = str(uuid.uuid4())
 
     @property
     def busy(self):
@@ -124,10 +189,19 @@ class Automation:
 
     async def status(self, request):
         data = await self.body(request, {'run_id'})
-        record = self.records.get(data['run_id'])
-        if not record:
-            raise web.HTTPNotFound(text='RUN_UNKNOWN')
-        return web.json_response(self.public(record))
+        async with self.gateway.lock:
+            record = self.records.get(data['run_id'])
+            result = self.public(record) if record else {'run_id': data['run_id'], 'status': 'unknown'}
+            closed = (not self.busy and self.gateway.session is None and
+                      (record is None or record.get('process_closed') is True) and managed_processes_closed())
+            result.update(process_closed=closed, boot_id=self.boot_id,
+                          closure_source='supervisor' if closed and record and record.get('process_closed') else 'fresh_proc_scan')
+            if record:
+                if isinstance(record.get('exit_code'), int):
+                    result['exit_code'] = record['exit_code']
+                if record.get('memory'):
+                    result['memory'] = record['memory']
+            return web.json_response(result)
 
     @staticmethod
     async def output(reader):
@@ -157,9 +231,17 @@ class Automation:
                 await asyncio.wait_for(process.wait(), 3)
             except asyncio.TimeoutError:
                 self.blocked = True
+        # SIGKILL dispatch alone is not proof that detached Chromium has exited.
+        for _ in range(20):
+            if process.returncode is not None and managed_processes_closed():
+                return True
+            await asyncio.sleep(.05)
+        self.blocked = True
+        return False
 
     async def execute(self, record, token):
         process = None
+        before_memory = memory_counters()
         deadline = asyncio.get_running_loop().time() + self.timeout
         def remaining():
             return max(.001, deadline - asyncio.get_running_loop().time())
@@ -184,6 +266,7 @@ class Automation:
             process.stdin.close()
             values = await asyncio.wait_for(asyncio.gather(process.wait(), self.output(process.stdout)), remaining())
             code, raw = values
+            values = None
             result = json.loads(raw)
             raw = None
             if not isinstance(result, dict) or result.get('status') not in FINAL_STATUSES:
@@ -204,10 +287,21 @@ class Automation:
         finally:
             token = None
             try:
-                await self.kill(process, record['run_id'])
+                record['process_closed'] = await self.kill(process, record['run_id']) is True
+                if record['process_closed']:
+                    await asyncio.wait_for(asyncio.to_thread(cleanup_task_files, record['run_id']), 5)
             except Exception:
                 self.blocked = True
                 record.update(status='failed', code='BROWSER_CLOSE_UNCERTAIN')
+            if process and isinstance(process.returncode, int):
+                record['exit_code'] = process.returncode
+            after_memory = memory_counters()
+            record['memory'] = after_memory
+            if 'oom_kill' in before_memory and 'oom_kill' in after_memory:
+                delta = max(0, after_memory['oom_kill'] - before_memory['oom_kill'])
+                record['memory']['oom_kill_delta'] = delta
+                if delta and record['status'] == 'failed':
+                    record['code'] = 'HOSTED_MEMORY_LIMIT_REACHED'
             record['process'] = None
             self.active_run = None
 
