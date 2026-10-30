@@ -6,10 +6,10 @@ import path from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 
 const UUID=/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
-const OPS=new Set(['session_get','preview','claim','payload','media','checkpoint','complete','fail','session_put','report_claim','report_binding','report_settle','report_finish','finish']);
+const OPS=new Set(['session_get','preview','claim','payload','media','checkpoint','complete','fail','session_put','report_claim','report_binding','report_settle','report_finish','reconcile_binding','reconcile_complete','finish']);
 const safeFailure=code=>Object.assign(new Error(code),{code});
 function taskValue(value){
-  if(!value||Object.keys(value).some(key=>!['run_id','lease_token','mode'].includes(key))||!UUID.test(value.run_id||'')||!UUID.test(value.lease_token||'')||!['send','report'].includes(value.mode))throw safeFailure('INVALID_HOSTED_TASK');
+  if(!value||Object.keys(value).some(key=>!['run_id','lease_token','mode'].includes(key))||!UUID.test(value.run_id||'')||!UUID.test(value.lease_token||'')||!['send','report','import_reconcile'].includes(value.mode))throw safeFailure('INVALID_HOSTED_TASK');
   return {run_id:value.run_id,lease_token:value.lease_token,mode:value.mode};
 }
 async function limitedBody(response,limit){
@@ -74,7 +74,7 @@ export async function loadAndRun(input,{env=process.env,fetcher=fetch,puppeteer=
 if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)){
   try{
     let raw='';for await(const part of process.stdin){raw+=part;if(raw.length>2048)throw safeFailure('INVALID_HOSTED_TASK');}
-    const result=await loadAndRun(JSON.parse(raw)),safe={status:['submitted','idle','report_pending','report_applied','report_settlement_uncertain','failed'].includes(result?.status)?result.status:'failed'};
+    const result=await loadAndRun(JSON.parse(raw)),safe={status:['submitted','idle','report_pending','report_applied','report_settlement_uncertain','import_reconciled','failed'].includes(result?.status)?result.status:'failed'};
     if(typeof result?.code==='string'&&/^[A-Z0-9_]{1,100}$/.test(result.code))safe.code=result.code;
     process.stdout.write(JSON.stringify(safe)+'\n');if(safe.status==='failed')process.exitCode=1;
   }catch(error){process.stdout.write(JSON.stringify({status:'failed',code:/^[A-Z0-9_]{1,100}$/.test(error?.code||'')?error.code:'HOSTED_LOADER_FAILED'})+'\n');process.exitCode=1;}

@@ -14,7 +14,7 @@ from aiohttp import web
 UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 CODE = re.compile(r'[A-Z][A-Z0-9_]{0,99}')
 FINAL_STATUSES = {'submitted', 'report_pending', 'report_applied', 'failed',
-                  'idle', 'report_settlement_uncertain'}
+                  'idle', 'report_settlement_uncertain', 'import_reconciled'}
 
 
 def owned_browser_groups(run_id, proc_root=Path('/proc'), uid=None):
@@ -88,7 +88,7 @@ class Automation:
     async def begin(self, request):
         data = await self.body(request, {'run_id', 'lease_token', 'mode'})
         token, mode = data.get('lease_token'), data.get('mode', 'send')
-        if not isinstance(token, str) or not UUID.fullmatch(token) or mode not in ('send', 'report'):
+        if not isinstance(token, str) or not UUID.fullmatch(token) or mode not in ('send', 'report', 'import_reconcile'):
             raise web.HTTPBadRequest(text='INVALID_REQUEST')
         digest = hashlib.sha256(token.encode()).hexdigest()
         async with self.gateway.lock:
