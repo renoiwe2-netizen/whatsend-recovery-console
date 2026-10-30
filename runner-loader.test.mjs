@@ -163,3 +163,12 @@ test('two maximum-size media streams complete sequentially under a 48 MiB V8 hea
   assert.equal(metadata.streams,2);assert.ok(metadata.max_rss_kib<160*1024,'The loader alone must leave substantial space inside the shared 512 MiB budget');
   context.diagnostic(JSON.stringify(metadata));
 });
+
+test('the generic report loader forwards a cancellation capability and keeps its terminal result',async()=>{
+  const source='export async function runTask(task,{call}){await call("report_cancel",{proof:{synthetic:true},closed:true});return {status:"report_canceled"};}',f=fixture(source),parent=await mkdtemp(path.join(tmpdir(),'loader-cancel-test-'));
+  try{
+    assert.deepEqual(await loadAndRun({...task,mode:'report'},{...f,parent}),{status:'report_canceled'});
+    assert.deepEqual(f.requests[1].body,{op:'report_cancel',proof:{synthetic:true},closed:true,run_id:task.run_id,lease_token:task.lease_token});
+    assert.deepEqual(await readdir(parent),[]);
+  }finally{await rm(parent,{recursive:true,force:true});}
+});

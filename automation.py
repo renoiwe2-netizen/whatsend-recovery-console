@@ -15,7 +15,7 @@ from aiohttp import web
 
 UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 CODE = re.compile(r'[A-Z][A-Z0-9_]{0,99}')
-FINAL_STATUSES = {'submitted', 'report_pending', 'report_applied', 'failed',
+FINAL_STATUSES = {'submitted', 'report_pending', 'report_applied', 'report_canceled', 'failed',
                   'idle', 'report_settlement_uncertain', 'import_reconciled'}
 
 

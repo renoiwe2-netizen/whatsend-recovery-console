@@ -180,6 +180,11 @@ class AutomationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(process.stdin.closed)
         await self.finish({'status': 'report_pending'})
 
+    async def test_report_canceled_is_a_supported_terminal_result(self):
+        await self.begin(mode='report')
+        await self.finish({'status': 'report_canceled'})
+        self.assertEqual(self.automation.records[RUN]['status'], 'report_canceled')
+
     async def test_active_human_recovery_refuses_runner_without_closing_it(self):
         desktop = Desktop()
         self.gateway.relay = object()
